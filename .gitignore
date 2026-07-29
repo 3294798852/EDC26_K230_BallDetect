@@ -1,0 +1,9 @@
+# Local editor and Python cache files
+.vscode/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# Device-local configuration may contain Wi-Fi and API credentials.
+configs/sys_config.json

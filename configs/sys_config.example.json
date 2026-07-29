@@ -1,0 +1,58 @@
+{
+  "sensor": {
+    "ch1_width": 640,
+    "ch1_height": 480
+  },
+  "language": {
+    "text_path": "/sdcard/configs/languages/Chinese.json"
+  },
+  "display": {
+    "wallpaper": "",
+    "brightness": 69,
+    "LSwallpaper": "/sdcard/resources/wallpaper.png"
+  },
+  "safety": {
+    "password": "change_me",
+    "face_recognition": 1,
+    "kws": 0,
+    "face_recognition_path": "/sdcard/data/face_recognition.bin",
+    "kws_path": "/sdcard/data/kws.model"
+  },
+  "SYS_INFO": {
+    "os_version": "YAHBOOM K230 GUI 2.0",
+    "fw_version": "1.0",
+    "hello": 0,
+    "hw_version": "1.4"
+  },
+  "WLAN": {
+    "SSID": "your_wifi_ssid",
+    "status": 0,
+    "PASSWORD": "your_wifi_password"
+  },
+  "AP": {
+    "SSID": "YAHBOOM-K230",
+    "PASSWORD": "change_me",
+    "default_status": 0
+  },
+  "date": {
+    "async_time_by_wlan": 0,
+    "time_set": "None"
+  },
+  "sound": {
+    "volume": 59
+  },
+  "AI": {
+    "self_learning_labels": [
+      "Phone",
+      "Earphone"
+    ],
+    "LLM": {
+      "api_key": "your_api_key",
+      "api_type": "spark",
+      "api_model": "lite"
+    },
+    "face_database_path": "/data/face_database/",
+    "self_learning_database": "/data/self_learning_database/",
+    "face_register_path": "/data/face_register/"
+  }
+}

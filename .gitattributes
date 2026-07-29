@@ -1,0 +1,12 @@
+# Keep device assets byte-exact and out of text/line-ending conversion.
+*.bin binary
+*.eot binary
+*.jpg binary
+*.jpeg binary
+*.kmodel binary
+*.mp3 binary
+*.png binary
+*.ttf binary
+*.wav binary
+*.woff binary
+*.woff2 binary

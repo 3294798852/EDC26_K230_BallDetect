@@ -1,27 +1,30 @@
-# Standalone steel-ball UART protocol (MCU integration)
+# K230 steel-ball visual feedback UART protocol
 
-This document specifies the stream emitted by `K230_SDcard_proj2/main.py` and
-the corresponding 3519 implementation. It deliberately does not reuse the old
-multi-task lifecycle handshake: a camera frame is useful even when the MCU has
-not selected a task.
+## Scope and physical link
 
-## Physical link and framing
+This standalone application publishes camera-derived image state, physical
+ball state and a bounded feedback component. It does not use the legacy task
+handshake and does not require MCU-to-K230 control data.
 
 | Item | Value |
 | --- | --- |
 | K230 peripheral | UART1 |
-| K230 pins | IO9 TX, IO10 RX |
-| 3519 peripheral | UART6 (`UART_K230`), PC10 RX / PC11 TX |
-| Format | 512000 baud, 8 data bits, no parity, 1 stop bit |
-| Flow control | none |
-| Levels | 3.3 V TTL; common ground required |
-| Direction | K230 sends vision frames; MCU may still send legacy commands, which this standalone app ignores |
+| K230 pins | IO9 TX, IO10 RX (RX currently unused by this application) |
+| MCU connection | K230 IO9 TX -> MCU RX; common ground |
+| Format | 512000 baud, 8N1, no flow control |
+| Levels | 3.3 V TTL |
+| Direction | K230 to MCU |
 | Frame size | fixed 48 bytes |
 
-The generic envelope is little-endian. CRC16-CCITT-FALSE (polynomial `0x1021`,
-initial `0xFFFF`, no reflection/final xor) covers byte offsets `2` through `45`,
-excluding the two sync bytes and the two CRC bytes. The CRC is stored
-little-endian at offsets `46..47`.
+K230 never waits for an MCU response. UART writes use a bounded two-frame,
+latest-wins queue, so a disconnected receiver cannot block camera processing or
+cause unbounded memory growth.
+
+## Envelope
+
+All multibyte fields are little-endian. CRC16-CCITT-FALSE uses polynomial
+`0x1021`, initial value `0xFFFF`, no reflection/final xor. It covers offsets
+`2..45`; CRC is stored at `46..47`.
 
 | Offset | Size | Field | Value |
 | ---: | ---: | --- | --- |
@@ -29,124 +32,98 @@ little-endian at offsets `46..47`.
 | 1 | 1 | sync 1 | `0x5A` |
 | 2 | 1 | envelope version | `1` |
 | 3 | 1 | message type | `0x02` (`VISION_EVENT`) |
-| 4 | 1 | payload schema | `2` |
-| 5 | 1 | transport flags | bit 0 `REALTIME` |
+| 4 | 1 | payload schema | `4` |
+| 5 | 1 | transport flags | `0x01` (`REALTIME`) |
 | 6..7 | 2 | payload length | `32` |
-| 8..9 | 2 | sequence | `u16`, wraps naturally |
-| 10..13 | 4 | sender timestamp | K230 milliseconds, `u32` wrap |
-| 14..45 | 32 | payload | schema-2 kind-3 state |
+| 8..9 | 2 | sequence | `u16`, wraps modulo 65536 |
+| 10..13 | 4 | timestamp | K230 milliseconds, `u32` |
+| 14..45 | 32 | payload | schema-4 kind-5 visual feedback |
 | 46..47 | 2 | CRC16 | over offsets `2..45` |
 
-The MCU generic parser validates sync, version, length and CRC before calling
-the payload decoder. Do not map the payload to a C `struct`: padding and
-alignment are implementation-defined. Read each field from its documented
-little-endian offset.
+## Payload schema 4, kind 5
 
-## Payload schema 2, kind 3
+| Payload offset | Frame offset | Size | Type / scale | Field |
+| ---: | ---: | ---: | --- | --- |
+| 0 | 14 | 1 | `u8` | kind `5` |
+| 1 | 15 | 1 | `u8` | flags |
+| 2 | 16 | 1 | `u8` | selected confidence x255 |
+| 3 | 17 | 1 | `u8` | consecutive missed/rejected frames |
+| 4..5 | 18..19 | 2 | `u16` px | raw selected center X |
+| 6..7 | 20..21 | 2 | `u16` px | raw selected center Y |
+| 8..9 | 22..23 | 2 | `u16`, /100 | filtered image X |
+| 10..11 | 24..25 | 2 | `u16`, /100 | filtered image Y |
+| 12..13 | 26..27 | 2 | `i16`, /10 | filtered image X velocity, px/s |
+| 14..15 | 28..29 | 2 | `i16`, /10 | filtered image Y velocity, px/s |
+| 16..17 | 30..31 | 2 | `i16`, /100 | physical position `x`, cm |
+| 18..19 | 32..33 | 2 | `i16`, /10 | physical velocity `v`, cm/s |
+| 20..21 | 34..35 | 2 | `i16`, /10 | visual acceleration `a`, cm/s2 |
+| 22..23 | 36..37 | 2 | `i16`, /10 | feedback component `a_fb`, cm/s2 |
+| 24..25 | 38..39 | 2 | `u16` ms | AI2D/KPU/postprocess time |
+| 26..27 | 40..41 | 2 | `u16` ms | accepted-measurement age; `0xFFFF` unavailable |
+| 28..29 | 42..43 | 2 | `u16`, /100 | `Kp` |
+| 30 | 44 | 1 | `u8`, /10 | `Kd` |
+| 31 | 45 | 1 | `u8`, /100 | `Ka` |
 
-Payload offset `0` is always `kind=3`.
+The feedback definition is
 
-| Offset | Size | Type / scale | Field |
-| ---: | ---: | --- | --- |
-| 0 | 1 | `u8` | kind (`3`) |
-| 1 | 1 | `u8` bit mask | state flags (below) |
-| 2 | 1 | `u8` | confidence x 255 |
-| 3 | 1 | `u8` | consecutive missed/rejected frames, saturating |
-| 4..5 | 2 | `u16` pixels | raw selected-box center X |
-| 6..7 | 2 | `u16` pixels | raw selected-box center Y |
-| 8..9 | 2 | `u16`, /100 | filtered X in the 320x320 inference image |
-| 10..11 | 2 | `u16`, /100 | filtered Y in the 320x320 inference image |
-| 12..13 | 2 | `i16`, /10 | filtered X velocity, pixels/s |
-| 14..15 | 2 | `i16`, /10 | filtered Y velocity, pixels/s |
-| 16..17 | 2 | `u16` pixels | selected box X |
-| 18..19 | 2 | `u16` pixels | selected box Y |
-| 20..21 | 2 | `u16` pixels | selected box width |
-| 22..23 | 2 | `u16` pixels | selected box height |
-| 24..25 | 2 | `u16` ms | KPU/AI2D/postprocess inference time |
-| 26..27 | 2 | `u16` ms | age of last accepted measurement; `0xFFFF` unavailable |
-| 28..29 | 2 | `i16`, /16384 | pipe-axis X unit component |
-| 30..31 | 2 | `i16`, /16384 | pipe-axis Y unit component |
+```text
+a_fb = -(Kp*Db(x, 0.05) + Kd*Db(v, 1.0) + Ka*a)
+Db(z, width) = sign(z) * max(abs(z) - width, 0)
+```
 
-Coordinates are bounded to `[0,319]` for pixel positions and `[0,319.99]` for
-filtered fixed-point positions. Velocities are signed. A no-ball frame has
-`RAW_DETECTED=0`; its box and raw-coordinate fields are zero, while the filter
-may still report a short predicted coast. `TRACK_VALID=0` is the authoritative
-indicator that the snapshot is not usable for control.
+The deadbands above affect only `a_fb`; the transmitted `x` and `v` fields remain
+the filtered physical state before deadband. `Ka` defaults to zero, while `a`
+remains available for diagnostics. `a_fb` is an equivalent ball-acceleration
+feedback component, not a desired pipe angle or actuator/PWM command.
 
 ### Flags
 
 | Bit | Name | Meaning |
 | ---: | --- | --- |
-| 0 | `RAW_DETECTED` | a valid class-0 candidate was selected this frame |
-| 1 | `MEASUREMENT_ACCEPTED` | the candidate passed the motion gate and updated the filter |
-| 2 | `TRACK_VALID` | last accepted measurement is no older than 250 ms |
-| 3 | `PREDICTED` | current position/velocity includes coast prediction |
-| 4 | `AXIS_LOCKED` | pipe motion axis has been learned and locked |
-| 5 | `OUTLIER_REJECTED` | the highest-confidence candidate failed the motion gate |
-| 6 | `EDGE_CLIPPED` | selected box touched or crossed the image edge |
-| 7 | `FILTER_RESET` | this frame initialized/reinitialized the filter |
+| 0 | `RAW_DETECTED` | one candidate was selected this frame |
+| 1 | `MEASUREMENT_ACCEPTED` | candidate updated the motion filter |
+| 2 | `TRACK_VALID` | tracked or bounded-hold state is usable |
+| 3 | `PREDICTED` | no current detection; bounded hold prediction is published |
+| 4 | `FEEDBACK_VALID` | physical state and `a_fb` may be used by MCU composition |
+| 5 | `OUTLIER_REJECTED` | association or measurement gate rejected detections |
+| 6 | `EDGE_CLIPPED` | selected box touches/crosses the image edge |
+| 7 | `FEEDBACK_SATURATED` | `a_fb` reached its configured magnitude limit |
 
-`RAW_DETECTED` and `MEASUREMENT_ACCEPTED` are intentionally separate. A
-high-confidence false detection can be selected but rejected by the
-one-dimensional motion gate; the program does not silently fall back to a
-lower-confidence box.
+## MCU use
 
-## 3519 decoder and usage
+The MCU should validate exact size, version, schema, kind, transport flags and
+CRC before decoding. Do not map the payload directly to a C structure.
 
-The MCU changes are intentionally limited to the existing transport/payload
-layers:
+After validating freshness and ranges, decode the three states as follows:
 
-```c
-#include "Comm/k230_link.h"
+| State | Required flag combination | MCU action |
+| --- | --- | --- |
+| `DETECT` | `MEASUREMENT_ACCEPTED=1`, `TRACK_VALID=1`, `FEEDBACK_VALID=1`, `PREDICTED=0`, `EDGE_CLIPPED=0` | use measured-state feedback |
+| `HOLD` | `MEASUREMENT_ACCEPTED=0`, `TRACK_VALID=1`, `FEEDBACK_VALID=1`, `PREDICTED=1` | use bounded predicted feedback; monitor `missed_frames` and `measurement_age_ms` |
+| `LOST` | `TRACK_VALID=0` or `FEEDBACK_VALID=0` | ignore `a_fb`, warn and enter the defined safe/fallback state |
 
-k230_ball_state_t ball;
-k230_data_state_t state;
+K230 limits `HOLD` to at most 8 consecutive missed frames and 300 ms, with
+either limit ending hold. The MCU must still enforce its own frame-arrival
+freshness timeout, because receiving no UART frames cannot be reported by K230
+flags.
 
-k230_link_service(now_ms);
-state = k230_link_read_ball_state(&ball, now_ms);
-if (state == K230_DATA_FRESH &&
-    (ball.flags & K230_BALL_STATE_FLAG_TRACK_VALID) != 0U) {
-    /* Use ball.filtered_*_x100 and ball.velocity_*_x10 after scaling. */
-}
-```
+The MCU owns:
 
-`k230_decode_ball_state()` validates the exact 32-byte payload, kind, fixed
-coordinate ranges, Q14 axis range, and raw box ranges whenever `RAW_DETECTED`
-is set. It decodes into a temporary object and publishes only on success, so a
-malformed frame cannot partially overwrite the previous snapshot.
-`k230_link_read_ball_state()` returns:
+- `X`, `X_dot`, `X_ddot` generation;
+- car-acceleration sensing/feedforward;
+- any integral or additional state terms;
+- rolling-ball model inversion and desired pipe angle;
+- measured pipe-angle inner loop;
+- actuator bounds, stale-data handling and safety arbitration.
 
-- `K230_DATA_NONE` before the first valid state frame;
-- `K230_DATA_FRESH` when the local receive time is within 250 ms;
-- `K230_DATA_STALE` after that timeout (the last values remain available for
-  diagnostics, but are not control-valid).
+Schema 3 frames from the previous build carried a desired angle at payload
+28..29 and are semantically incompatible with schema 4. The MCU must not decode
+schema 4 using the schema-3 structure or treat `a_fb` as an angle.
 
-The MCU UART6 RX/TX rings are 256 bytes (255 usable), and the foreground parser
-is bounded per service pass. This is larger than one 48-byte frame and absorbs
-several frames if the foreground is briefly occupied. Keep any additional
-consumer ring at least 128 bytes and preserve the existing SPSC ownership
-rules.
+## Verification boundary
 
-The standalone stream does not establish `session_established`, send ACKs, or
-produce STATUS. The existing legacy link state machine can therefore remain in
-its HELLO/retry state without preventing vision publication; applications that
-use this project should read the ball-state API directly and must not gate it on
-`k230_link_task_confirmed()`.
-
-## Safety and freshness
-
-This frame is a measurement, not an actuator command. Before any actuator
-decision the MCU must independently check freshness, `TRACK_VALID`, acceptable
-confidence/edge flags, local limits, and the current safety state. A stale,
-predicted-only, CRC-invalid, disconnected, or otherwise rejected stream must
-lead to the application's defined safe behavior. Never drive an actuator
-directly from an unchecked raw coordinate or from a snapshot older than the
-250 ms timeout.
-
-## Verification status
-
-The 3519 host C suite includes a fixed schema-2 frame with signed velocities,
-Q14 axis values, CRC/framing, and invalid-coordinate rejection. The K230
-modules pass AST and protocol/filter model checks. K230 KPU loading, display,
-UART electrical levels, wire-level CRC, and end-to-end board reception remain
-target-board verification items rather than claims made by these host checks.
+K230 host tests cover fixed length, scales, signed values, CRC, split/coalesced
+frames, noise recovery and feedback bounds. The MCU decoder has not been
+modified in this task and must be updated separately for schema 4. End-to-end
+UART, sign convention, physical calibration, controller composition and
+actuator safety still require hardware verification.

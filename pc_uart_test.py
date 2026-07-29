@@ -37,9 +37,9 @@ if not K230_RUNTIME:
     import argparse
 
     from ball_protocol import (
-        BALL_FLAG_AXIS_LOCKED,
+        BALL_FLAG_FEEDBACK_SATURATED,
+        BALL_FLAG_FEEDBACK_VALID,
         BALL_FLAG_EDGE_CLIPPED,
-        BALL_FLAG_FILTER_RESET,
         BALL_FLAG_MEASUREMENT_ACCEPTED,
         BALL_FLAG_OUTLIER_REJECTED,
         BALL_FLAG_PREDICTED,
@@ -63,10 +63,10 @@ else:
     BALL_FLAG_MEASUREMENT_ACCEPTED = 0x02
     BALL_FLAG_TRACK_VALID = 0x04
     BALL_FLAG_PREDICTED = 0x08
-    BALL_FLAG_AXIS_LOCKED = 0x10
+    BALL_FLAG_FEEDBACK_VALID = 0x10
     BALL_FLAG_OUTLIER_REJECTED = 0x20
     BALL_FLAG_EDGE_CLIPPED = 0x40
-    BALL_FLAG_FILTER_RESET = 0x80
+    BALL_FLAG_FEEDBACK_SATURATED = 0x80
     BALL_STATE_FRAME_SIZE = 48
     BALL_STATE_PAYLOAD_SIZE = 32
     UART_HEADER_SIZE = 14
@@ -83,10 +83,10 @@ FLAG_NAMES = (
     (BALL_FLAG_MEASUREMENT_ACCEPTED, "MEAS"),
     (BALL_FLAG_TRACK_VALID, "TRACK"),
     (BALL_FLAG_PREDICTED, "PRED"),
-    (BALL_FLAG_AXIS_LOCKED, "AXIS"),
+    (BALL_FLAG_FEEDBACK_VALID, "FB"),
     (BALL_FLAG_OUTLIER_REJECTED, "OUTLIER"),
     (BALL_FLAG_EDGE_CLIPPED, "EDGE"),
-    (BALL_FLAG_FILTER_RESET, "RESET"),
+    (BALL_FLAG_FEEDBACK_SATURATED, "FBSAT"),
 )
 
 
@@ -186,12 +186,31 @@ def _format_age(age_ms):
     return "N/A" if int(age_ms) == 0xFFFF else "{}ms".format(int(age_ms))
 
 
+def _format_tracking_mode(flags):
+    flags = int(flags)
+    if (
+        flags & BALL_FLAG_MEASUREMENT_ACCEPTED
+        and flags & BALL_FLAG_TRACK_VALID
+        and flags & BALL_FLAG_FEEDBACK_VALID
+        and not flags & BALL_FLAG_PREDICTED
+    ):
+        return "DETECT"
+    if (
+        flags & BALL_FLAG_PREDICTED
+        and flags & BALL_FLAG_TRACK_VALID
+        and flags & BALL_FLAG_FEEDBACK_VALID
+    ):
+        return "HOLD"
+    return "LOST"
+
+
 def print_state(state, raw_frame=None):
     print(
-        "seq={:5d} k230_ms={:10d} flags={:<34s} conf={:.3f} "
+        "seq={:5d} k230_ms={:10d} mode={:<6s} flags={:<34s} conf={:.3f} "
         "miss={} infer={}ms meas_age={}".format(
             state["sequence"],
             state["timestamp_ms"],
+            _format_tracking_mode(state["flags"]),
             _format_flags(state["flags"]),
             state["confidence_x255"] / 255.0,
             state["missed_frames"],
@@ -201,20 +220,25 @@ def print_state(state, raw_frame=None):
     )
     print(
         "  raw=({:3d},{:3d}) filt=({:7.2f},{:7.2f}) "
-        "vel=({:8.1f},{:8.1f})px/s axis=({:+.4f},{:+.4f}) "
-        "box=({},{},{},{})".format(
+        "vel=({:8.1f},{:8.1f})px/s".format(
             state["raw_x"],
             state["raw_y"],
             state["filtered_x"],
             state["filtered_y"],
             state["vx"],
             state["vy"],
-            state["axis_x"],
-            state["axis_y"],
-            state["box_x"],
-            state["box_y"],
-            state["box_w"],
-            state["box_h"],
+        )
+    )
+    print(
+        "  phys p={:+.2f}cm v={:+.1f}cm/s a={:+.1f}cm/s2 "
+        "feedback={:+.1f}cm/s2 kp={:.2f} kd={:.2f} ka={:.2f}".format(
+            state["position_cm"],
+            state["velocity_cm_s"],
+            state["acceleration_cm_s2"],
+            state["feedback_acceleration_cm_s2"],
+            state["kp"],
+            state["kd"],
+            state["ka"],
         )
     )
     if raw_frame is not None:
@@ -281,19 +305,30 @@ def run_self_test():
         "y": 67.89,
         "vx": -45.6,
         "vy": 7.8,
-        "axis_x": 0.7071,
-        "axis_y": 0.7071,
         "missed_frames": 0,
         "measurement_age_ms": 20,
+    }
+    feedback = {
+        "position_cm": -3.25,
+        "velocity_cm_s": 12.3,
+        "acceleration_cm_s2": 18.4,
+        "feedback_acceleration_cm_s2": -36.6,
+        "kp": 16.0,
+        "kd": 7.2,
+        "ka": 0.05,
     }
     flags = (
         BALL_FLAG_RAW_DETECTED
         | BALL_FLAG_MEASUREMENT_ACCEPTED
         | BALL_FLAG_TRACK_VALID
-        | BALL_FLAG_AXIS_LOCKED
+        | BALL_FLAG_FEEDBACK_VALID
     )
-    first = encode_ball_state_frame(7, 1000, flags, state, candidate, 17)
-    second = encode_ball_state_frame(8, 1033, flags, state, candidate, 18)
+    first = encode_ball_state_frame(
+        7, 1000, flags, state, candidate, 17, feedback
+    )
+    second = encode_ball_state_frame(
+        8, 1033, flags, state, candidate, 18, feedback
+    )
 
     parser = BallStreamParser()
     decoded_frames = []
@@ -310,6 +345,14 @@ def run_self_test():
     ]
     assert parser.sequence_gaps == 0
     assert parser.discarded_bytes == 2
+    decoded = decode_ball_state_frame(decoded_frames[0])
+    assert decoded["position_cm"] == -3.25
+    assert decoded["velocity_cm_s"] == 12.3
+    assert decoded["acceleration_cm_s2"] == 18.4
+    assert decoded["feedback_acceleration_cm_s2"] == -36.6
+    assert decoded["kp"] == 16.0
+    assert decoded["kd"] == 7.2
+    assert decoded["ka"] == 0.05
 
     corrupted = bytearray(first)
     corrupted[20] ^= 0x01

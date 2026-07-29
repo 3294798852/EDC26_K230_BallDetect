@@ -1,8 +1,8 @@
-"""Fixed-size UART protocol for the standalone steel-ball tracker.
+"""Fixed 48-byte UART protocol for visual ball state and feedback.
 
-The envelope is compatible with the previous K230 project, while schema 2
-contains one filtered target state instead of a variable list of detections.
-All multi-byte values are little-endian and the complete frame is 48 bytes.
+Schema 4 carries only camera-derived image/physical state and the bounded
+state-feedback term. Reference generation, car feedforward, beam-angle inversion
+and the measured-angle inner loop belong to the MCU.
 """
 
 
@@ -12,8 +12,8 @@ UART_PROTOCOL_VERSION = 1
 UART_MSG_VISION_EVENT = 0x02
 UART_FRAME_FLAG_REALTIME = 1 << 0
 
-BALL_STATE_SCHEMA_VERSION = 2
-BALL_STATE_KIND = 3
+BALL_STATE_SCHEMA_VERSION = 4
+BALL_STATE_KIND = 5
 BALL_STATE_PAYLOAD_SIZE = 32
 UART_HEADER_SIZE = 14
 UART_CRC_SIZE = 2
@@ -21,20 +21,24 @@ BALL_STATE_FRAME_SIZE = (
     UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE + UART_CRC_SIZE
 )
 
-# Payload flags.
 BALL_FLAG_RAW_DETECTED = 1 << 0
 BALL_FLAG_MEASUREMENT_ACCEPTED = 1 << 1
 BALL_FLAG_TRACK_VALID = 1 << 2
 BALL_FLAG_PREDICTED = 1 << 3
-BALL_FLAG_AXIS_LOCKED = 1 << 4
+BALL_FLAG_FEEDBACK_VALID = 1 << 4
 BALL_FLAG_OUTLIER_REJECTED = 1 << 5
 BALL_FLAG_EDGE_CLIPPED = 1 << 6
-BALL_FLAG_FILTER_RESET = 1 << 7
+BALL_FLAG_FEEDBACK_SATURATED = 1 << 7
 
 BALL_COORD_SCALE = 100
 BALL_VELOCITY_SCALE = 10
-BALL_AXIS_Q = 14
-BALL_AXIS_SCALE = 1 << BALL_AXIS_Q
+BALL_POSITION_CM_SCALE = 100
+BALL_PHYSICAL_VELOCITY_SCALE = 10
+BALL_ACCELERATION_SCALE = 10
+BALL_FEEDBACK_SCALE = 10
+BALL_GAIN_SCALE = 100
+BALL_DERIVATIVE_GAIN_SCALE = 10
+BALL_ACCEL_GAIN_SCALE = 100
 
 
 def _clamp(value, low, high):
@@ -115,8 +119,9 @@ def encode_ball_state_frame(
     state,
     candidate=None,
     inference_ms=0,
+    feedback=None,
 ):
-    """Encode one fixed 48-byte filtered-ball state frame."""
+    """Encode one fixed 48-byte visual-state/feedback frame."""
     frame = bytearray(BALL_STATE_FRAME_SIZE)
     frame[0] = UART_SYNC_0
     frame[1] = UART_SYNC_1
@@ -131,18 +136,16 @@ def encode_ball_state_frame(
     payload = UART_HEADER_SIZE
     frame[payload] = BALL_STATE_KIND
     frame[payload + 1] = int(flags) & 0xFF
-    confidence = _clamp(
+    frame[payload + 2] = _clamp(
         _round_int(_candidate_value(candidate, "confidence", 0.0) * 255.0),
         0,
         255,
     )
-    frame[payload + 2] = confidence
     frame[payload + 3] = _clamp(
         int(_state_value(state, "missed_frames", 0)),
         0,
         255,
     )
-
     _put_u16(
         frame,
         payload + 4,
@@ -189,31 +192,55 @@ def encode_ball_state_frame(
             32767,
         ),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 16,
-        _clamp(int(_candidate_value(candidate, "x", 0)), 0, 0xFFFF),
+        _clamp(
+            _round_int(
+                _state_value(feedback, "position_cm", 0.0)
+                * BALL_POSITION_CM_SCALE
+            ),
+            -32768,
+            32767,
+        ),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 18,
-        _clamp(int(_candidate_value(candidate, "y", 0)), 0, 0xFFFF),
+        _clamp(
+            _round_int(
+                _state_value(feedback, "velocity_cm_s", 0.0)
+                * BALL_PHYSICAL_VELOCITY_SCALE
+            ),
+            -32768,
+            32767,
+        ),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 20,
-        _clamp(int(_candidate_value(candidate, "w", 0)), 0, 0xFFFF),
+        _clamp(
+            _round_int(
+                _state_value(feedback, "acceleration_cm_s2", 0.0)
+                * BALL_ACCELERATION_SCALE
+            ),
+            -32768,
+            32767,
+        ),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 22,
-        _clamp(int(_candidate_value(candidate, "h", 0)), 0, 0xFFFF),
+        _clamp(
+            _round_int(
+                _state_value(feedback, "feedback_acceleration_cm_s2", 0.0)
+                * BALL_FEEDBACK_SCALE
+            ),
+            -32768,
+            32767,
+        ),
     )
-    _put_u16(
-        frame,
-        payload + 24,
-        _clamp(int(inference_ms), 0, 0xFFFF),
-    )
+    _put_u16(frame, payload + 24, _clamp(int(inference_ms), 0, 0xFFFF))
     _put_u16(
         frame,
         payload + 26,
@@ -223,23 +250,29 @@ def encode_ball_state_frame(
             0xFFFF,
         ),
     )
-    _put_i16(
+    _put_u16(
         frame,
         payload + 28,
         _clamp(
-            _round_int(_state_value(state, "axis_x", 1.0) * BALL_AXIS_SCALE),
-            -32768,
-            32767,
+            _round_int(_state_value(feedback, "kp", 0.0) * BALL_GAIN_SCALE),
+            0,
+            0xFFFF,
         ),
     )
-    _put_i16(
-        frame,
-        payload + 30,
-        _clamp(
-            _round_int(_state_value(state, "axis_y", 0.0) * BALL_AXIS_SCALE),
-            -32768,
-            32767,
+    frame[payload + 30] = _clamp(
+        _round_int(
+            _state_value(feedback, "kd", 0.0)
+            * BALL_DERIVATIVE_GAIN_SCALE
         ),
+        0,
+        255,
+    )
+    frame[payload + 31] = _clamp(
+        _round_int(
+            _state_value(feedback, "ka", 0.0) * BALL_ACCEL_GAIN_SCALE
+        ),
+        0,
+        255,
     )
 
     crc_offset = UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE
@@ -258,6 +291,8 @@ def validate_ball_state_frame(frame):
         return False
     if int(frame[4]) != BALL_STATE_SCHEMA_VERSION:
         return False
+    if int(frame[5]) != UART_FRAME_FLAG_REALTIME:
+        return False
     if _get_u16(frame, 6) != BALL_STATE_PAYLOAD_SIZE:
         return False
     if int(frame[UART_HEADER_SIZE]) != BALL_STATE_KIND:
@@ -271,11 +306,13 @@ def validate_ball_state_frame(frame):
 
 
 def decode_ball_state_frame(frame):
-    """Validate and decode a frame; intended for tests and MCU-side models."""
+    """Validate and decode one schema-4 frame for host diagnostics."""
     if not validate_ball_state_frame(frame):
-        raise ValueError("invalid filtered-ball UART frame")
+        raise ValueError("invalid visual-ball UART frame")
     payload = UART_HEADER_SIZE
     return {
+        "schema_version": int(frame[4]),
+        "kind": int(frame[payload]),
         "sequence": _get_u16(frame, 8),
         "timestamp_ms": _get_u32(frame, 10),
         "flags": int(frame[payload + 1]),
@@ -287,13 +324,19 @@ def decode_ball_state_frame(frame):
         "filtered_y": _get_u16(frame, payload + 10) / float(BALL_COORD_SCALE),
         "vx": _get_i16(frame, payload + 12) / float(BALL_VELOCITY_SCALE),
         "vy": _get_i16(frame, payload + 14) / float(BALL_VELOCITY_SCALE),
-        "box_x": _get_u16(frame, payload + 16),
-        "box_y": _get_u16(frame, payload + 18),
-        "box_w": _get_u16(frame, payload + 20),
-        "box_h": _get_u16(frame, payload + 22),
+        "position_cm": _get_i16(frame, payload + 16)
+        / float(BALL_POSITION_CM_SCALE),
+        "velocity_cm_s": _get_i16(frame, payload + 18)
+        / float(BALL_PHYSICAL_VELOCITY_SCALE),
+        "acceleration_cm_s2": _get_i16(frame, payload + 20)
+        / float(BALL_ACCELERATION_SCALE),
+        "feedback_acceleration_cm_s2": _get_i16(frame, payload + 22)
+        / float(BALL_FEEDBACK_SCALE),
         "inference_ms": _get_u16(frame, payload + 24),
         "measurement_age_ms": _get_u16(frame, payload + 26),
-        "axis_x": _get_i16(frame, payload + 28) / float(BALL_AXIS_SCALE),
-        "axis_y": _get_i16(frame, payload + 30) / float(BALL_AXIS_SCALE),
+        "kp": _get_u16(frame, payload + 28) / float(BALL_GAIN_SCALE),
+        "kd": int(frame[payload + 30])
+        / float(BALL_DERIVATIVE_GAIN_SCALE),
+        "ka": int(frame[payload + 31]) / float(BALL_ACCEL_GAIN_SCALE),
         "crc16": _get_u16(frame, BALL_STATE_FRAME_SIZE - UART_CRC_SIZE),
     }

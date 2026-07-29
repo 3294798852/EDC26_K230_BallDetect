@@ -23,20 +23,23 @@ MediaManager = None
 Sensor = None
 CAM_CHN_ID_0 = 0
 CAM_CHN_ID_2 = 2
+PIXEL_FORMAT_RGB_565 = 0
 PIXEL_FORMAT_RGB_888_PLANAR = 0
 PIXEL_FORMAT_YUV_SEMIPLANAR_420 = 0
 PipeMotionFilter = None
-select_highest_confidence_ball = None
+normalize_postprocessed_ball_candidates = None
+BallStateFeedback = None
+RoiDarkBlobDetector = None
 encode_ball_state_frame = None
 
 BALL_FLAG_RAW_DETECTED = 0x01
 BALL_FLAG_MEASUREMENT_ACCEPTED = 0x02
 BALL_FLAG_TRACK_VALID = 0x04
 BALL_FLAG_PREDICTED = 0x08
-BALL_FLAG_AXIS_LOCKED = 0x10
+BALL_FLAG_FEEDBACK_VALID = 0x10
 BALL_FLAG_OUTLIER_REJECTED = 0x20
 BALL_FLAG_EDGE_CLIPPED = 0x40
-BALL_FLAG_FILTER_RESET = 0x80
+BALL_FLAG_FEEDBACK_SATURATED = 0x80
 BALL_STATE_FRAME_SIZE = 48
 
 _BOOT_IMPORT_ERROR = None
@@ -60,6 +63,7 @@ try:
     from media.sensor import (
         CAM_CHN_ID_0,
         CAM_CHN_ID_2,
+        PIXEL_FORMAT_RGB_565,
         PIXEL_FORMAT_RGB_888_PLANAR,
         PIXEL_FORMAT_YUV_SEMIPLANAR_420,
         Sensor,
@@ -67,9 +71,9 @@ try:
 
     _BOOT_IMPORT_STAGE = "import_ball_protocol"
     from ball_protocol import (
-        BALL_FLAG_AXIS_LOCKED,
+        BALL_FLAG_FEEDBACK_SATURATED,
+        BALL_FLAG_FEEDBACK_VALID,
         BALL_FLAG_EDGE_CLIPPED,
-        BALL_FLAG_FILTER_RESET,
         BALL_FLAG_MEASUREMENT_ACCEPTED,
         BALL_FLAG_OUTLIER_REJECTED,
         BALL_FLAG_PREDICTED,
@@ -79,20 +83,75 @@ try:
         encode_ball_state_frame,
     )
     _BOOT_IMPORT_STAGE = "import_ball_tracking"
-    from ball_tracking import PipeMotionFilter, select_highest_confidence_ball
+    from ball_tracking import (
+        PipeMotionFilter,
+        normalize_postprocessed_ball_candidates,
+    )
+    _BOOT_IMPORT_STAGE = "import_ball_control"
+    from ball_control import BallStateFeedback
+    _BOOT_IMPORT_STAGE = "import_ball_roi_detector"
+    from ball_roi_detector import RoiDarkBlobDetector
     _BOOT_IMPORT_STAGE = None
 except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.2"
-MODEL_PATH = "/sdcard/task_assets/ball_det/ball_det_yolov8n_320.kmodel"
+APP_VERSION = "proj2-1.14"
+
+# Select one detector backend here: "yolov8n", "yolov8", or "roi_blob".
+# The generic "yolov8" artifact has no trustworthy subtype metadata.
+MODEL_BACKEND = "roi_blob"
+MODEL_BACKENDS = {
+    "yolov8n": {
+        "display_name": "YOLOv8n",
+        "path": "/sdcard/task_assets/ball_det/ball_det_yolov8n_320.kmodel",
+        "expected_output": (1, 5, 2100),
+    },
+    "yolov8": {
+        "display_name": "YOLOv8 custom",
+        "path": "/sdcard/task_assets/ball_det/ball_det_yolov8_320.kmodel",
+        "expected_output": (1, 5, 2100),
+    },
+    "roi_blob": {
+        "display_name": "ROI dark blob",
+        "native_roi": True,
+    },
+}
 MODEL_INPUT_WIDTH = 320
 MODEL_INPUT_HEIGHT = 320
-MODEL_EXPECTED_OUTPUT = (1, 5, 2100)
 CONFIDENCE_THRESHOLD = 0.35
 NMS_THRESHOLD = 0.45
-POSTPROCESS_MAX_BOXES = 8
+POSTPROCESS_MAX_BOXES = 4
+
+# Native ROI dark-blob backend. The ROI follows the calibrated pipe axis.
+ROI_HALF_WIDTH_PX = 22.0
+ROI_THRESHOLD_SAMPLE_HALF_WIDTH_PX = 10.0
+ROI_ENDPOINT_MARGIN_PX = 4.0
+ROI_MIN_DIAMETER_PX = 4.0
+ROI_MAX_DIAMETER_PX = 26.0
+ROI_TARGET_DIAMETER_PX = 11.0
+ROI_MIN_PIXELS = 12
+ROI_THRESHOLD_RATIO = 0.60
+ROI_THRESHOLD_L_MIN = 20
+ROI_THRESHOLD_L_MAX = 62
+ROI_THRESHOLD_UPDATE_FRAMES = 6
+
+# Visual-to-physical calibration. Positive position points from the negative
+# endpoint to the positive endpoint. Values remain provisional until measured.
+PIPE_NEGATIVE_END_X_PX = 10.0
+PIPE_NEGATIVE_END_Y_PX = 160.0
+PIPE_POSITIVE_END_X_PX = 310.0
+PIPE_POSITIVE_END_Y_PX = 160.0
+PIPE_LENGTH_CM = 25.0
+
+# K230 publishes only its camera-derived state-feedback term. Physical position
+# and velocity pass through continuous soft deadbands before their gains.
+FEEDBACK_KP = 16.0
+FEEDBACK_KD = 7.2
+FEEDBACK_KA = 0.0
+FEEDBACK_ACCEL_LIMIT_CM_S2 = 250.0
+TRACK_HOLD_MAX_FRAMES = 8
+TRACK_HOLD_MAX_MS = 300
 
 CAMERA_FPS = 30
 DISPLAY_WIDTH = 640
@@ -104,6 +163,7 @@ MAX_CONSECUTIVE_FRAME_ERRORS = 3
 
 UART_BAUDRATE = 512000
 UART_MAX_WRITE_BYTES = 64
+
 UART_SOFTWARE_FRAME_CAPACITY = 2
 UART_SOFTWARE_BUFFER_BYTES = (
     BALL_STATE_FRAME_SIZE * UART_SOFTWARE_FRAME_CAPACITY
@@ -117,7 +177,7 @@ COLOR_BAD = (255, 255, 40, 40)
 COLOR_RAW = (255, 255, 180, 0)
 COLOR_FILTERED = (255, 0, 255, 255)
 COLOR_AXIS = (255, 80, 160, 255)
-STATUS_PANEL_HEIGHT = 182
+STATUS_PANEL_HEIGHT = 230
 
 
 def _ticks_ms():
@@ -329,34 +389,64 @@ def _emergency_hold_fatal(stage, exc, tx=None, already_reported=False):
                 print("emergency media deinit warning:", cleanup_exc)
 
 
+def _selected_model_config():
+    config = MODEL_BACKENDS.get(MODEL_BACKEND)
+    if config is None:
+        raise RuntimeError(
+            "unknown MODEL_BACKEND {}; use yolov8n, yolov8 or roi_blob".format(
+                MODEL_BACKEND
+            )
+        )
+    if config.get("native_roi"):
+        return config
+    if not config.get("path") or not config.get("expected_output"):
+        raise RuntimeError("incomplete model backend: " + MODEL_BACKEND)
+    return config
+
+
 def _verify_model():
+    config = _selected_model_config()
+    if config.get("native_roi"):
+        return
+    model_path = config["path"]
     try:
-        stat = os.stat(MODEL_PATH)
+        stat = os.stat(model_path)
     except Exception as exc:
         raise RuntimeError(
             "model stat failed {}: {}: {}".format(
-                MODEL_PATH,
+                model_path,
                 type(exc).__name__,
                 exc,
             )
         )
     if int(stat[6]) <= 0:
-        raise RuntimeError("empty model: " + MODEL_PATH)
+        raise RuntimeError("empty model: " + model_path)
 
 
 class BallDetector:
     """Minimal single-output YOLOv8 KPU path using verified CanMV APIs."""
 
     def __init__(self):
+        config = _selected_model_config()
+        self.model_backend = MODEL_BACKEND
+        self.model_display_name = config["display_name"]
+        self.model_path = config["path"]
+        self.expected_output = config["expected_output"]
+        self.pipeline_name = "native_nms_top4"
+        self.actual_output = None
         self.kpu = None
         self.ai2d = None
         self.ai2d_builder = None
         self.ai2d_output_tensor = None
         self.ai2d_input_tensor = None
         self.output_shape_checked = False
+        self.preprocess_ms = 0
+        self.kpu_ms = 0
+        self.postprocess_ms = 0
+        self.last_detection_count = 0
         try:
             self.kpu = nn.kpu()
-            self.kpu.load_kmodel(MODEL_PATH)
+            self.kpu.load_kmodel(self.model_path)
             if int(self.kpu.inputs_size()) != 1:
                 raise RuntimeError("ball model must have exactly one input")
             if int(self.kpu.outputs_size()) != 1:
@@ -409,31 +499,50 @@ class BallDetector:
         if shape is None or len(shape) != 3:
             raise RuntimeError("ball model returned an invalid output rank")
         actual = (int(shape[0]), int(shape[1]), int(shape[2]))
-        if actual != MODEL_EXPECTED_OUTPUT:
+        self.actual_output = actual
+        if actual != self.expected_output:
             raise RuntimeError(
-                "ball model output {} != {}".format(
+                "model {} output {} != {}".format(
+                    self.model_backend,
                     actual,
-                    MODEL_EXPECTED_OUTPUT,
+                    self.expected_output,
                 )
             )
         self.output_shape_checked = True
 
     def run(self, input_array):
+        self.preprocess_ms = 0
+        self.kpu_ms = 0
+        self.postprocess_ms = 0
+        self.last_detection_count = 0
+        preprocess_start_ms = _ticks_ms()
         self.ai2d_input_tensor = nn.from_numpy(input_array)
         self.ai2d_builder.run(
             self.ai2d_input_tensor,
             self.ai2d_output_tensor,
         )
+        preprocess_finished_ms = _ticks_ms()
+        self.preprocess_ms = max(
+            0,
+            _ticks_diff(preprocess_finished_ms, preprocess_start_ms),
+        )
         self.kpu.set_input_tensor(0, self.ai2d_output_tensor)
         self.kpu.run()
+        kpu_finished_ms = _ticks_ms()
+        self.kpu_ms = max(
+            0,
+            _ticks_diff(kpu_finished_ms, preprocess_finished_ms),
+        )
         output_tensor = self.kpu.get_output_tensor(0)
-        output_array = output_tensor.to_numpy()
-        del output_tensor
+        try:
+            output_array = output_tensor.to_numpy()
+        finally:
+            del output_tensor
         self.ai2d_input_tensor = None
         if not self.output_shape_checked:
             self._check_output_shape(output_array)
         candidates = output_array[0].transpose()
-        return aidemo.yolov8_det_postprocess(
+        raw_result = aidemo.yolov8_det_postprocess(
             candidates.copy(),
             [MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH],
             [MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH],
@@ -443,6 +552,22 @@ class BallDetector:
             NMS_THRESHOLD,
             POSTPROCESS_MAX_BOXES,
         )
+        candidates = normalize_postprocessed_ball_candidates(
+            raw_result,
+            CONFIDENCE_THRESHOLD,
+            MODEL_INPUT_WIDTH,
+            MODEL_INPUT_HEIGHT,
+            POSTPROCESS_MAX_BOXES,
+        )
+        self.last_detection_count = len(candidates)
+        self.postprocess_ms = max(
+            0,
+            _ticks_diff(_ticks_ms(), kpu_finished_ms),
+        )
+        return candidates
+
+    def diagnostic_text(self):
+        return "YOLO det={}".format(int(self.last_detection_count))
 
     def deinit(self):
         self.ai2d_input_tensor = None
@@ -457,6 +582,32 @@ class BallDetector:
             print("KPU memory-pool shrink warning:", exc)
 
 
+def _create_detector():
+    config = _selected_model_config()
+    if config.get("native_roi"):
+        return RoiDarkBlobDetector(
+            frame_width=MODEL_INPUT_WIDTH,
+            frame_height=MODEL_INPUT_HEIGHT,
+            negative_end_x_px=PIPE_NEGATIVE_END_X_PX,
+            negative_end_y_px=PIPE_NEGATIVE_END_Y_PX,
+            positive_end_x_px=PIPE_POSITIVE_END_X_PX,
+            positive_end_y_px=PIPE_POSITIVE_END_Y_PX,
+            roi_half_width_px=ROI_HALF_WIDTH_PX,
+            threshold_sample_half_width_px=ROI_THRESHOLD_SAMPLE_HALF_WIDTH_PX,
+            endpoint_margin_px=ROI_ENDPOINT_MARGIN_PX,
+            min_diameter_px=ROI_MIN_DIAMETER_PX,
+            max_diameter_px=ROI_MAX_DIAMETER_PX,
+            target_diameter_px=ROI_TARGET_DIAMETER_PX,
+            min_pixels=ROI_MIN_PIXELS,
+            threshold_ratio=ROI_THRESHOLD_RATIO,
+            threshold_l_min=ROI_THRESHOLD_L_MIN,
+            threshold_l_max=ROI_THRESHOLD_L_MAX,
+            threshold_update_frames=ROI_THRESHOLD_UPDATE_FRAMES,
+            max_candidates=POSTPROCESS_MAX_BOXES,
+        )
+    return BallDetector()
+
+
 class CameraDisplay:
     """Own camera channel 0 video, channel 2 AI input and one OSD layer."""
 
@@ -466,6 +617,9 @@ class CameraDisplay:
         self.display_initialized = False
         self.media_initialized = False
         self.sensor_running = False
+        self.native_roi_input = bool(
+            _selected_model_config().get("native_roi")
+        )
 
     def start(self):
         sensor = Sensor(fps=CAMERA_FPS)
@@ -486,7 +640,9 @@ class CameraDisplay:
             chn=CAM_CHN_ID_2,
         )
         sensor.set_pixformat(
-            PIXEL_FORMAT_RGB_888_PLANAR,
+            PIXEL_FORMAT_RGB_565
+            if self.native_roi_input
+            else PIXEL_FORMAT_RGB_888_PLANAR,
             chn=CAM_CHN_ID_2,
         )
         self.osd = image.Image(
@@ -516,7 +672,9 @@ class CameraDisplay:
     def get_frame(self):
         frame = self.sensor.snapshot(chn=CAM_CHN_ID_2)
         if frame is None:
-            raise RuntimeError("camera returned no AI frame")
+            raise RuntimeError("camera returned no detector frame")
+        if self.native_roi_input:
+            return frame
         return frame.to_numpy_ref()
 
     @staticmethod
@@ -540,26 +698,36 @@ class CameraDisplay:
         self,
         candidate,
         state,
+        feedback,
         inference_ms,
+        capture_ms,
         frame_interval_ms,
+        detector,
         tx,
         runtime_error=None,
     ):
         osd = self.osd
+        if feedback is None:
+            feedback = {}
         osd.clear()
         osd.draw_rectangle(
-            0,
-            0,
-            DISPLAY_WIDTH,
-            STATUS_PANEL_HEIGHT,
-            color=COLOR_PANEL,
-            fill=True,
+            0, 0, DISPLAY_WIDTH, STATUS_PANEL_HEIGHT,
+            color=COLOR_PANEL, fill=True,
         )
 
-        if candidate is not None:
-            box_color = (
-                COLOR_BAD if state.get("outlier_rejected") else COLOR_RAW
+        if detector.model_backend == "roi_blob":
+            roi_x, roi_y, roi_width, roi_height = detector.roi
+            osd.draw_rectangle(
+                self._screen_x(roi_x),
+                self._screen_y(roi_y),
+                max(1, self._screen_x(roi_width)),
+                max(1, self._screen_y(roi_height)),
+                color=COLOR_AXIS,
+                thickness=1,
             )
+
+        if candidate is not None:
+            box_color = COLOR_BAD if state.get("outlier_rejected") else COLOR_RAW
             osd.draw_rectangle(
                 self._screen_x(candidate["x"]),
                 self._screen_y(candidate["y"]),
@@ -570,11 +738,9 @@ class CameraDisplay:
             )
 
         if state.get("track_valid"):
-            center_x = self._screen_x(state["x"])
-            center_y = self._screen_y(state["y"])
             osd.draw_cross(
-                center_x,
-                center_y,
+                self._screen_x(state["x"]),
+                self._screen_y(state["y"]),
                 color=COLOR_FILTERED,
                 size=12,
                 thickness=2,
@@ -592,45 +758,79 @@ class CameraDisplay:
                     thickness=2,
                 )
 
-        if state.get("measurement_accepted"):
-            mode = "MEAS"
+        mode = _tracking_mode(state, feedback)
+        if mode == "DETECT":
             mode_color = COLOR_GOOD
-        elif state.get("track_valid"):
-            mode = "PRED"
+        elif mode.startswith("HOLD"):
             mode_color = COLOR_WARN
         else:
-            mode = "NO TRACK"
             mode_color = COLOR_BAD
         self._draw_text(
             0,
-            "STEEL BALL {} {}".format(APP_VERSION, mode),
+            "STEEL BALL {} {} {}".format(
+                APP_VERSION, detector.model_backend, mode
+            ),
             mode_color,
         )
         self._draw_text(
             1,
-            "F x={:.2f} y={:.2f}  Vx={:.1f} Vy={:.1f} px/s".format(
+            "px=({:.2f},{:.2f}) v=({:.1f},{:.1f}) c={:.2f} age={}".format(
                 state.get("x", 0.0),
                 state.get("y", 0.0),
                 state.get("vx", 0.0),
                 state.get("vy", 0.0),
+                0.0 if candidate is None else candidate["confidence"],
+                int(state.get("measurement_age_ms", 0xFFFF)),
             ),
             COLOR_GOOD if state.get("track_valid") else COLOR_WARN,
         )
-        confidence = 0.0 if candidate is None else candidate["confidence"]
         self._draw_text(
             2,
-            "conf={:.3f} infer={}ms age={}ms axis={} frame={}ms".format(
-                confidence,
-                int(inference_ms),
-                int(state.get("measurement_age_ms", 0xFFFF)),
-                "LOCK" if state.get("axis_locked") else "LEARN",
-                int(frame_interval_ms),
+            "cm p={:+.2f} v={:+.2f} a={:+.1f}".format(
+                float(feedback.get("position_cm", 0.0)),
+                float(feedback.get("velocity_cm_s", 0.0)),
+                float(feedback.get("acceleration_cm_s2", 0.0)),
             ),
             COLOR_TITLE,
         )
         self._draw_text(
             3,
-            "UART txF={} txB={} repl={} queued={}/{}B".format(
+            "FB={:+.1f} kp={:.1f} kd={:.1f} ka={:.2f} {} sat={}".format(
+                float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+                float(feedback.get("kp", 0.0)),
+                float(feedback.get("kd", 0.0)),
+                float(feedback.get("ka", 0.0)),
+                "VALID" if feedback.get("feedback_valid") else "INVALID",
+                "Y" if feedback.get("feedback_saturated") else "N",
+            ),
+            COLOR_GOOD if feedback.get("feedback_valid") else COLOR_WARN,
+        )
+        self._draw_text(
+            4,
+            "T cap={} pre={} kpu={} post={} ai={} fb={} frm={}".format(
+                int(capture_ms),
+                int(detector.preprocess_ms),
+                int(detector.kpu_ms),
+                int(detector.postprocess_ms),
+                int(inference_ms),
+                int(feedback.get("compute_ms", 0)),
+                int(frame_interval_ms),
+            ),
+            COLOR_TITLE,
+        )
+        self._draw_text(
+            5,
+            "{} reject={} acq={}/{}".format(
+                detector.diagnostic_text(),
+                int(state.get("association_reject_count", 0)),
+                int(state.get("acquisition_count", 0)),
+                int(state.get("acquisition_required", 3)),
+            ),
+            COLOR_BAD if state.get("association_rejected") else COLOR_TITLE,
+        )
+        self._draw_text(
+            6,
+            "UART TX f={} b={} repl={} q={}/{}B".format(
                 tx.sent_frames,
                 tx.bytes_sent,
                 tx.replaced_frames,
@@ -640,33 +840,26 @@ class CameraDisplay:
             COLOR_GOOD,
         )
         self._draw_text(
-            4,
+            7,
             "UART err={} short={} zero={} drop={}".format(
                 tx.write_errors,
                 tx.short_writes,
                 tx.zero_writes,
                 tx.dropped_error_frames,
             ),
-            COLOR_BAD
-            if (
-                tx.write_errors
-                or tx.short_writes
-                or tx.zero_writes
+            COLOR_BAD if (
+                tx.write_errors or tx.short_writes or tx.zero_writes
                 or tx.dropped_error_frames
-            )
-            else COLOR_GOOD,
+            ) else COLOR_GOOD,
         )
+        visible_error = runtime_error
+        if visible_error is None:
+            visible_error = tx.last_error
         self._draw_text(
-            5,
-            "UART last: " + str(tx.last_error)[:65],
-            COLOR_BAD if tx.last_error is not None else COLOR_GOOD,
+            8,
+            "last: " + str(visible_error)[:70],
+            COLOR_BAD if visible_error is not None else COLOR_GOOD,
         )
-        if runtime_error is not None:
-            self._draw_text(
-                6,
-                "latched error: " + str(runtime_error)[:65],
-                COLOR_BAD,
-            )
         Display.show_image(osd, 0, 0, Display.LAYER_OSD3)
 
     def draw_fatal(self, stage, exc, tx):
@@ -863,6 +1056,7 @@ class LatestFrameUartTx:
         return total
 
 
+
 def _open_uart():
     fpioa = FPIOA()
     fpioa.set_function(9, fpioa.UART1_TXD, ie=0, oe=1, pu=1)
@@ -870,7 +1064,25 @@ def _open_uart():
     return UART(UART.UART1, UART_BAUDRATE)
 
 
-def _state_flags(candidate, state):
+def _tracking_mode(state, feedback):
+    if feedback.get("feedback_valid") and state.get("measurement_accepted"):
+        return "DETECT"
+    if feedback.get("feedback_valid") and state.get("predicted"):
+        return "HOLD {}/{}".format(
+            int(state.get("missed_frames", 0)),
+            TRACK_HOLD_MAX_FRAMES,
+        )
+    if state.get("acquisition_pending"):
+        return "LOST ACQ {}/{}".format(
+            int(state.get("acquisition_count", 0)),
+            int(state.get("acquisition_required", 3)),
+        )
+    return "LOST"
+
+
+def _state_flags(candidate, state, feedback=None):
+    if feedback is None:
+        feedback = {}
     flags = 0
     if candidate is not None:
         flags |= BALL_FLAG_RAW_DETECTED
@@ -882,23 +1094,32 @@ def _state_flags(candidate, state):
         flags |= BALL_FLAG_TRACK_VALID
     if state.get("predicted"):
         flags |= BALL_FLAG_PREDICTED
-    if state.get("axis_locked"):
-        flags |= BALL_FLAG_AXIS_LOCKED
-    if state.get("outlier_rejected"):
+    if feedback.get("feedback_valid"):
+        flags |= BALL_FLAG_FEEDBACK_VALID
+    if state.get("outlier_rejected") or state.get("association_rejected"):
         flags |= BALL_FLAG_OUTLIER_REJECTED
-    if state.get("filter_reset"):
-        flags |= BALL_FLAG_FILTER_RESET
+    if feedback.get("feedback_saturated"):
+        flags |= BALL_FLAG_FEEDBACK_SATURATED
     return flags
 
 
-def _publish_state(tx, sequence, now_ms, candidate, state, inference_ms):
+def _publish_state(
+    tx,
+    sequence,
+    now_ms,
+    candidate,
+    state,
+    feedback,
+    inference_ms,
+):
     frame = encode_ball_state_frame(
         sequence=sequence,
         timestamp_ms=now_ms,
-        flags=_state_flags(candidate, state),
+        flags=_state_flags(candidate, state, feedback),
         state=state,
         candidate=candidate,
         inference_ms=inference_ms,
+        feedback=feedback,
     )
     tx.submit_latest(frame)
     tx.poll()
@@ -908,10 +1129,15 @@ def _print_pc_debug_status(
     sequence,
     candidate,
     state,
+    feedback,
     inference_ms,
+    capture_ms,
+    detector,
     tx,
     runtime_error,
 ):
+    if feedback is None:
+        feedback = {}
     if candidate is None:
         raw_x = -1.0
         raw_y = -1.0
@@ -921,12 +1147,16 @@ def _print_pc_debug_status(
         raw_y = float(candidate.get("center_y", -1.0))
         confidence = float(candidate.get("confidence", 0.0))
     print(
-        "PCDBG seq={} flags=0x{:02X} raw=({:.1f},{:.1f}) "
+        "PCDBG seq={} mode={} flags=0x{:02X} raw=({:.1f},{:.1f}) "
         "filt=({:.2f},{:.2f}) vel=({:.1f},{:.1f}) conf={:.3f} "
-        "infer={}ms UART[f={},b={},q={},e={},s={},z={},d={}] "
+        "phys[p={:+.2f},v={:+.2f},a={:+.1f}] "
+        "fb[a={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
+        "model={} diag={} time[cap={},pre={},kpu={},post={},ai={}]ms "
+        "UART[f={},b={},q={},e={},s={},z={},d={}] "
         "uart_last={} runtime_last={}".format(
             int(sequence),
-            _state_flags(candidate, state),
+            _tracking_mode(state, feedback),
+            _state_flags(candidate, state, feedback),
             raw_x,
             raw_y,
             float(state.get("x", 0.0)),
@@ -934,6 +1164,21 @@ def _print_pc_debug_status(
             float(state.get("vx", 0.0)),
             float(state.get("vy", 0.0)),
             confidence,
+            float(feedback.get("position_cm", 0.0)),
+            float(feedback.get("velocity_cm_s", 0.0)),
+            float(feedback.get("acceleration_cm_s2", 0.0)),
+            float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+            float(feedback.get("kp", 0.0)),
+            float(feedback.get("kd", 0.0)),
+            float(feedback.get("ka", 0.0)),
+            "Y" if feedback.get("feedback_valid") else "N",
+            "Y" if feedback.get("feedback_saturated") else "N",
+            detector.model_backend,
+            detector.diagnostic_text(),
+            int(capture_ms),
+            int(detector.preprocess_ms),
+            int(detector.kpu_ms),
+            int(detector.postprocess_ms),
             int(inference_ms),
             tx.sent_frames,
             tx.bytes_sent,
@@ -946,7 +1191,6 @@ def _print_pc_debug_status(
             str(runtime_error)[:48],
         )
     )
-
 
 def _hold_fatal(camera, stage, exc, tx):
     print(
@@ -990,6 +1234,7 @@ def main(pc_debug=False):
     camera = None
     detector = None
     tracker = None
+    feedback_filter = None
     stage = "camera_object_init"
     sequence = 0
     try:
@@ -1002,17 +1247,43 @@ def main(pc_debug=False):
         uart = _open_uart()
         tx = LatestFrameUartTx(uart)
         stage = "tracker_init"
-        tracker = PipeMotionFilter()
+        tracker = PipeMotionFilter(
+            max_coast_ms=TRACK_HOLD_MAX_MS,
+            max_coast_frames=TRACK_HOLD_MAX_FRAMES,
+        )
+        stage = "feedback_init"
+        feedback_filter = BallStateFeedback(
+            negative_end_x_px=PIPE_NEGATIVE_END_X_PX,
+            negative_end_y_px=PIPE_NEGATIVE_END_Y_PX,
+            positive_end_x_px=PIPE_POSITIVE_END_X_PX,
+            positive_end_y_px=PIPE_POSITIVE_END_Y_PX,
+            pipe_length_cm=PIPE_LENGTH_CM,
+            kp=FEEDBACK_KP,
+            kd=FEEDBACK_KD,
+            ka=FEEDBACK_KA,
+            max_feedback_accel_cm_s2=FEEDBACK_ACCEL_LIMIT_CM_S2,
+            max_prediction_age_ms=TRACK_HOLD_MAX_MS,
+            max_prediction_frames=TRACK_HOLD_MAX_FRAMES,
+        )
         stage = "detector_init"
-        detector = BallDetector()
+        detector = _create_detector()
         print(
-            "steel-ball tracker started, version={}, model={}, UART={} 8N1, "
-            "frame={}B, software_tx={}B, pc_debug={}".format(
+            "steel-ball tracker started, version={}, backend={}, model={}, "
+            "expected={}, UART={} 8N1, frame={}B, software_tx={}B, "
+            "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ka={:.3f}, "
+            "px_per_cm={:.3f}, pc_debug={}".format(
                 APP_VERSION,
-                MODEL_PATH,
+                detector.model_backend,
+                detector.model_path,
+                detector.expected_output,
                 UART_BAUDRATE,
                 BALL_STATE_FRAME_SIZE,
                 UART_SOFTWARE_BUFFER_BYTES,
+                detector.pipeline_name,
+                float(feedback_filter.kp),
+                float(feedback_filter.kd),
+                float(feedback_filter.ka),
+                float(feedback_filter.pixels_per_cm),
                 bool(pc_debug),
             )
         )
@@ -1028,7 +1299,10 @@ def main(pc_debug=False):
             _exitpoint()
             tx.poll()
             candidate = None
+            detections = []
+            feedback = None
             inference_ms = 0
+            capture_ms = 0
             now_ms = _ticks_ms()
             frame_interval_ms = max(
                 0,
@@ -1037,23 +1311,37 @@ def main(pc_debug=False):
             last_frame_ms = now_ms
             try:
                 stage = "camera_capture"
-                input_array = camera.get_frame()
+                capture_start_ms = _ticks_ms()
+                detector_input = camera.get_frame()
+                capture_finished_ms = _ticks_ms()
+                capture_ms = max(
+                    0,
+                    _ticks_diff(capture_finished_ms, capture_start_ms),
+                )
                 stage = "model_inference"
-                inference_start_ms = _ticks_ms()
-                raw_result = detector.run(input_array)
+                inference_start_ms = capture_finished_ms
+                detections = detector.run(detector_input)
                 finished_ms = _ticks_ms()
                 inference_ms = max(
                     0,
                     _ticks_diff(finished_ms, inference_start_ms),
                 )
-                stage = "primary_selection"
-                candidate = select_highest_confidence_ball(
-                    raw_result,
-                    MODEL_INPUT_WIDTH,
-                    MODEL_INPUT_HEIGHT,
-                )
+                stage = "target_association"
+                candidate = tracker.select_candidate(detections, finished_ms)
                 stage = "motion_filter"
                 state = tracker.update(candidate, finished_ms)
+                stage = "visual_feedback"
+                feedback_start_ms = _ticks_ms()
+                feedback = feedback_filter.update(
+                    state,
+                    candidate,
+                    finished_ms,
+                )
+                feedback_finished_ms = _ticks_ms()
+                feedback["compute_ms"] = max(
+                    0,
+                    _ticks_diff(feedback_finished_ms, feedback_start_ms),
+                )
                 sequence = (sequence + 1) & 0xFFFF
                 stage = "uart_publish"
                 _publish_state(
@@ -1062,10 +1350,11 @@ def main(pc_debug=False):
                     finished_ms,
                     candidate,
                     state,
+                    feedback,
                     inference_ms,
                 )
                 consecutive_errors = 0
-                now_ms = finished_ms
+                now_ms = feedback_finished_ms
             except Exception as frame_exc:
                 if _is_ide_interrupt(frame_exc):
                     raise KeyboardInterrupt()
@@ -1088,7 +1377,10 @@ def main(pc_debug=False):
                 )
                 now_ms = _ticks_ms()
                 candidate = None
+                detections = []
+                tracker.select_candidate(detections, now_ms)
                 state = tracker.update(None, now_ms)
+                feedback = feedback_filter.update(state, None, now_ms)
                 sequence = (sequence + 1) & 0xFFFF
                 stage = "uart_error_publish"
                 _publish_state(
@@ -1097,6 +1389,7 @@ def main(pc_debug=False):
                     now_ms,
                     None,
                     state,
+                    feedback,
                     0,
                 )
                 if consecutive_errors >= MAX_CONSECUTIVE_FRAME_ERRORS:
@@ -1113,8 +1406,11 @@ def main(pc_debug=False):
                 camera.draw_status(
                     candidate,
                     state,
+                    feedback,
                     inference_ms,
+                    capture_ms,
                     frame_interval_ms,
+                    detector,
                     tx,
                     runtime_error=latched_runtime_error,
                 )
@@ -1129,7 +1425,10 @@ def main(pc_debug=False):
                     sequence,
                     candidate,
                     state,
+                    feedback,
                     inference_ms,
+                    capture_ms,
+                    detector,
                     tx,
                     latched_runtime_error,
                 )
@@ -1160,7 +1459,6 @@ def main(pc_debug=False):
             except Exception as exc:
                 print("UART deinit warning:", exc)
         gc.collect()
-
 
 def run(pc_debug=False):
     if _BOOT_IMPORT_ERROR is not None:

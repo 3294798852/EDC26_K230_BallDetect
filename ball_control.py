@@ -2,6 +2,14 @@
 
 import time
 
+from ball_calibration import (
+    X_CALIBRATION_PINHOLE,
+    get_x_calibration_lut,
+    x_center_scale,
+    x_position_and_scale,
+    y_position_cm,
+)
+
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
@@ -16,19 +24,15 @@ def _ticks_diff(new_value, old_value):
 class BallStateFeedback:
     """Convert filtered pixels into physical state and feedback acceleration.
 
-    K230 owns only the camera-derived state-feedback term. Position and velocity
-    use continuous soft deadbands before their gains are applied. The MCU owns the
-    reference trajectory, car-acceleration feedforward, beam model inversion,
-    measured-angle inner loop and all actuator safety decisions.
+    K230 owns the camera-derived state-feedback term and current stationary
+    reference preset. Position and velocity use continuous soft deadbands before
+    their gains are applied. The MCU owns any future moving trajectory,
+    car-acceleration feedforward, beam model inversion, measured-angle inner
+    loop and all actuator safety decisions.
     """
 
     def __init__(
         self,
-        negative_end_x_px=10.0,
-        negative_end_y_px=160.0,
-        positive_end_x_px=310.0,
-        positive_end_y_px=160.0,
-        pipe_length_cm=25.0,
         kp=16.0,
         kd=7.2,
         ka=0.0,
@@ -40,28 +44,27 @@ class BallStateFeedback:
         velocity_deadband_cm_s=1.0,
         acceleration_alpha=0.30,
         max_measured_accel_cm_s2=2000.0,
+        x_calibration_mode=X_CALIBRATION_PINHOLE,
+        reference_position_cm=0.0,
+        max_abs_reference_position_cm=12.5,
+        reference_state_flags=0,
     ):
-        dx = float(positive_end_x_px) - float(negative_end_x_px)
-        dy = float(positive_end_y_px) - float(negative_end_y_px)
-        span_squared = dx * dx + dy * dy
-        pipe_length_cm = float(pipe_length_cm)
-        self.calibration_valid = bool(
-            span_squared >= 400.0 and pipe_length_cm >= 1.0
+        self.x_calibration_mode = str(x_calibration_mode)
+        self.x_calibration_lut = get_x_calibration_lut(
+            self.x_calibration_mode
         )
-        if not self.calibration_valid:
-            span_squared = 1.0
-            pipe_length_cm = max(1.0, pipe_length_cm)
-        span_px = span_squared ** 0.5
-        self.axis_x = dx / span_px
-        self.axis_y = dy / span_px
-        self.center_x_px = (
-            float(negative_end_x_px) + float(positive_end_x_px)
-        ) * 0.5
-        self.center_y_px = (
-            float(negative_end_y_px) + float(positive_end_y_px)
-        ) * 0.5
-        self.pipe_length_cm = pipe_length_cm
-        self.pixels_per_cm = span_px / pipe_length_cm
+        self.calibration_valid = True
+        self.center_cm_per_pixel = x_center_scale(self.x_calibration_lut)
+        self.max_abs_reference_position_cm = max(
+            0.1,
+            float(max_abs_reference_position_cm),
+        )
+        self.reference_position_cm = 0.0
+        self.reference_state_flags = 0
+        self.set_reference_position_cm(
+            reference_position_cm,
+            reference_state_flags,
+        )
         self.kp = max(0.0, float(kp))
         self.kd = max(0.0, float(kd))
         self.ka = max(0.0, float(ka))
@@ -91,6 +94,28 @@ class BallStateFeedback:
         self.prediction_armed = False
         self.acceleration_cm_s2 = 0.0
 
+    def set_reference_position_cm(
+        self,
+        reference_position_cm,
+        reference_state_flags=None,
+    ):
+        """Set the absolute calibrated X coordinate used as equilibrium."""
+        value = float(reference_position_cm)
+        if value != value or abs(value) > self.max_abs_reference_position_cm:
+            raise ValueError(
+                "reference position must be within +/-{:.2f} cm".format(
+                    self.max_abs_reference_position_cm
+                )
+            )
+        flags = self.reference_state_flags
+        if reference_state_flags is not None:
+            flags = int(reference_state_flags)
+            if flags < 0 or flags > 0xFFFF:
+                raise ValueError("reference state flags must fit u16")
+        self.reference_position_cm = value
+        self.reference_state_flags = flags
+        return self.reference_position_cm
+
     def reset_runtime(self):
         self.last_update_ms = None
         self.last_velocity_cm_s = None
@@ -98,18 +123,26 @@ class BallStateFeedback:
         self.acceleration_cm_s2 = 0.0
 
     def _physical_state(self, state):
-        dx = float(state.get("x", 0.0)) - self.center_x_px
-        dy = float(state.get("y", 0.0)) - self.center_y_px
-        position_px = dx * self.axis_x + dy * self.axis_y
-        velocity_px_s = (
-            float(state.get("vx", 0.0)) * self.axis_x
-            + float(state.get("vy", 0.0)) * self.axis_y
+        position_x_cm, x_cm_per_pixel = x_position_and_scale(
+            state.get("x", 0.0),
+            self.x_calibration_lut,
+        )
+        position_y_cm = y_position_cm(
+            state.get("y", 0.0),
+            self.center_cm_per_pixel,
+        )
+        velocity_x_cm_s = (
+            float(state.get("vx", 0.0)) * x_cm_per_pixel
+        )
+        velocity_y_cm_s = (
+            float(state.get("vy", 0.0)) * self.center_cm_per_pixel
         )
         return (
-            position_px / self.pixels_per_cm,
-            velocity_px_s / self.pixels_per_cm,
+            position_x_cm,
+            position_y_cm,
+            velocity_x_cm_s,
+            velocity_y_cm_s,
         )
-
 
     def _apply_deadband(self, value, width):
         value = float(value)
@@ -148,9 +181,14 @@ class BallStateFeedback:
 
         if not state.get("track_valid"):
             self.reset_runtime()
-            return self._snapshot(0.0, 0.0, False, False)
+            return self._snapshot(0.0, 0.0, 0.0, 0.0, False, False)
 
-        position_cm, velocity_cm_s = self._physical_state(state)
+        (
+            position_cm,
+            position_y_cm,
+            velocity_cm_s,
+            velocity_y_cm_s,
+        ) = self._physical_state(state)
         measurement_age_ms = int(state.get("measurement_age_ms", 0xFFFF))
         missed_frames = int(state.get("missed_frames", 0xFFFF))
         measurement_current = bool(
@@ -176,7 +214,9 @@ class BallStateFeedback:
             self.acceleration_cm_s2 = 0.0
             return self._snapshot(
                 position_cm,
+                position_y_cm,
                 velocity_cm_s,
+                velocity_y_cm_s,
                 False,
                 False,
             )
@@ -187,7 +227,7 @@ class BallStateFeedback:
         else:
             self._update_acceleration(velocity_cm_s, dt)
         feedback_position_cm = self._apply_deadband(
-            position_cm,
+            position_cm - self.reference_position_cm,
             self.position_deadband_cm,
         )
         feedback_velocity_cm_s = self._apply_deadband(
@@ -206,7 +246,9 @@ class BallStateFeedback:
         )
         return self._snapshot(
             position_cm,
+            position_y_cm,
             velocity_cm_s,
+            velocity_y_cm_s,
             self.calibration_valid,
             feedback_accel != unconstrained_feedback,
             feedback_accel,
@@ -215,14 +257,26 @@ class BallStateFeedback:
     def _snapshot(
         self,
         position_cm,
+        position_y_cm,
         velocity_cm_s,
+        velocity_y_cm_s,
         feedback_valid,
         feedback_saturated,
         feedback_acceleration_cm_s2=0.0,
     ):
+        position_error_cm = 0.0
+        if feedback_valid:
+            position_error_cm = position_cm - self.reference_position_cm
         return {
             "position_cm": float(position_cm),
+            "reference_position_cm": float(self.reference_position_cm),
+            "position_error_cm": float(position_error_cm),
+            "reference_velocity_cm_s": 0.0,
+            "reference_acceleration_cm_s2": 0.0,
+            "reference_state_flags": int(self.reference_state_flags),
+            "position_y_cm": float(position_y_cm),
             "velocity_cm_s": float(velocity_cm_s),
+            "velocity_y_cm_s": float(velocity_y_cm_s),
             "acceleration_cm_s2": float(self.acceleration_cm_s2),
             "feedback_acceleration_cm_s2": float(
                 feedback_acceleration_cm_s2
@@ -230,7 +284,7 @@ class BallStateFeedback:
             "feedback_valid": bool(feedback_valid),
             "feedback_saturated": bool(feedback_saturated),
             "calibration_valid": bool(self.calibration_valid),
-            "pixels_per_cm": float(self.pixels_per_cm),
+            "center_cm_per_pixel": float(self.center_cm_per_pixel),
             "kp": float(self.kp),
             "kd": float(self.kd),
             "ka": float(self.ka),

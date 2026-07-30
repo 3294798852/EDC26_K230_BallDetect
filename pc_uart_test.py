@@ -45,6 +45,11 @@ if not K230_RUNTIME:
         BALL_FLAG_PREDICTED,
         BALL_FLAG_RAW_DETECTED,
         BALL_FLAG_TRACK_VALID,
+        BALL_REFERENCE_FLAG_SOURCE_ALGORITHM,
+        BALL_REFERENCE_FLAG_SOURCE_MCU,
+        BALL_REFERENCE_FLAG_SOURCE_PRESET,
+        BALL_REFERENCE_FLAG_SLEW_ACTIVE,
+        BALL_REFERENCE_FLAG_VALID,
         BALL_STATE_FRAME_SIZE,
         BALL_STATE_PAYLOAD_SIZE,
         UART_HEADER_SIZE,
@@ -67,8 +72,13 @@ else:
     BALL_FLAG_OUTLIER_REJECTED = 0x20
     BALL_FLAG_EDGE_CLIPPED = 0x40
     BALL_FLAG_FEEDBACK_SATURATED = 0x80
-    BALL_STATE_FRAME_SIZE = 48
-    BALL_STATE_PAYLOAD_SIZE = 32
+    BALL_REFERENCE_FLAG_VALID = 0x0001
+    BALL_REFERENCE_FLAG_SOURCE_PRESET = 0x0002
+    BALL_REFERENCE_FLAG_SOURCE_ALGORITHM = 0x0004
+    BALL_REFERENCE_FLAG_SOURCE_MCU = 0x0008
+    BALL_REFERENCE_FLAG_SLEW_ACTIVE = 0x0010
+    BALL_STATE_FRAME_SIZE = 64
+    BALL_STATE_PAYLOAD_SIZE = 48
     UART_HEADER_SIZE = 14
     UART_SYNC_0 = 0xA5
     UART_SYNC_1 = 0x5A
@@ -87,6 +97,14 @@ FLAG_NAMES = (
     (BALL_FLAG_OUTLIER_REJECTED, "OUTLIER"),
     (BALL_FLAG_EDGE_CLIPPED, "EDGE"),
     (BALL_FLAG_FEEDBACK_SATURATED, "FBSAT"),
+)
+
+REFERENCE_FLAG_NAMES = (
+    (BALL_REFERENCE_FLAG_VALID, "VALID"),
+    (BALL_REFERENCE_FLAG_SOURCE_PRESET, "PRESET"),
+    (BALL_REFERENCE_FLAG_SOURCE_ALGORITHM, "ALGO"),
+    (BALL_REFERENCE_FLAG_SOURCE_MCU, "MCU"),
+    (BALL_REFERENCE_FLAG_SLEW_ACTIVE, "SLEW"),
 )
 
 
@@ -182,6 +200,14 @@ def _format_flags(flags):
     return "|".join(names) if names else "NONE"
 
 
+def _format_reference_flags(flags):
+    names = [
+        name for mask, name in REFERENCE_FLAG_NAMES
+        if int(flags) & mask
+    ]
+    return "|".join(names) if names else "NONE"
+
+
 def _format_age(age_ms):
     return "N/A" if int(age_ms) == 0xFFFF else "{}ms".format(int(age_ms))
 
@@ -207,30 +233,30 @@ def _format_tracking_mode(flags):
 def print_state(state, raw_frame=None):
     print(
         "seq={:5d} k230_ms={:10d} mode={:<6s} flags={:<34s} conf={:.3f} "
-        "miss={} infer={}ms meas_age={}".format(
+        "miss={} det={}ms meas_age={}".format(
             state["sequence"],
             state["timestamp_ms"],
             _format_tracking_mode(state["flags"]),
             _format_flags(state["flags"]),
             state["confidence_x255"] / 255.0,
             state["missed_frames"],
-            state["inference_ms"],
+            state["detector_ms"],
             _format_age(state["measurement_age_ms"]),
         )
     )
     print(
-        "  raw=({:3d},{:3d}) filt=({:7.2f},{:7.2f}) "
-        "vel=({:8.1f},{:8.1f})px/s".format(
+        "  raw_px=({:3d},{:3d}) phys=({:+7.2f},{:+7.2f})cm "
+        "vel=({:+8.1f},{:+8.1f})cm/s".format(
             state["raw_x"],
             state["raw_y"],
-            state["filtered_x"],
-            state["filtered_y"],
-            state["vx"],
-            state["vy"],
+            state["physical_x_cm"],
+            state["physical_y_cm"],
+            state["physical_vx_cm_s"],
+            state["physical_vy_cm_s"],
         )
     )
     print(
-        "  phys p={:+.2f}cm v={:+.1f}cm/s a={:+.1f}cm/s2 "
+        "  axial p={:+.2f}cm v={:+.1f}cm/s a={:+.1f}cm/s2 "
         "feedback={:+.1f}cm/s2 kp={:.2f} kd={:.2f} ka={:.2f}".format(
             state["position_cm"],
             state["velocity_cm_s"],
@@ -239,6 +265,25 @@ def print_state(state, raw_frame=None):
             state["kp"],
             state["kd"],
             state["ka"],
+        )
+    )
+    consistency_text = "N/A"
+    if int(state["flags"]) & BALL_FLAG_FEEDBACK_VALID:
+        consistency_error = (
+            state["position_cm"]
+            - state["reference_position_cm"]
+            - state["position_error_cm"]
+        )
+        consistency_text = "{:+.3f}cm".format(consistency_error)
+    print(
+        "  ref p={:+.2f}cm e={:+.2f}cm v={:+.1f}cm/s a={:+.1f}cm/s2 "
+        "state={} check={}".format(
+            state["reference_position_cm"],
+            state["position_error_cm"],
+            state["reference_velocity_cm_s"],
+            state["reference_acceleration_cm_s2"],
+            _format_reference_flags(state["reference_state_flags"]),
+            consistency_text,
         )
     )
     if raw_frame is not None:
@@ -291,6 +336,120 @@ def list_serial_ports():
 
 
 def run_self_test():
+    from ball_calibration import (
+        X_CALIBRATION_MEASURED,
+        X_CALIBRATION_PINHOLE,
+        X_POSITION_CM_MEASURED_X10000,
+        X_POSITION_CM_X10000,
+        Y_CM_PER_PIXEL,
+        get_x_calibration_lut,
+        x_center_scale,
+        x_pixel_for_position_cm,
+        x_position_and_scale,
+        y_position_cm,
+    )
+
+    pinhole_lut = get_x_calibration_lut(X_CALIBRATION_PINHOLE)
+    measured_lut = get_x_calibration_lut(X_CALIBRATION_MEASURED)
+    assert pinhole_lut is X_POSITION_CM_X10000
+    assert measured_lut is X_POSITION_CM_MEASURED_X10000
+    for calibration_lut in (pinhole_lut, measured_lut):
+        assert len(calibration_lut) == 320
+        assert all(
+            calibration_lut[index] < calibration_lut[index + 1]
+            for index in range(319)
+        )
+        for pixel_x in (
+            0.0, 1.0, 80.25, 160.0, 240.75, 318.0, 319.0
+        ):
+            position_cm = x_position_and_scale(
+                pixel_x,
+                calibration_lut,
+            )[0]
+            assert abs(
+                x_pixel_for_position_cm(position_cm, calibration_lut)
+                - pixel_x
+            ) < 0.0001
+    assert x_position_and_scale(160.0)[0] == 0.0
+    assert abs(x_position_and_scale(160.5)[0] - 0.03255) < 0.0001
+    assert x_pixel_for_position_cm(-100.0) == 0.0
+    assert x_pixel_for_position_cm(100.0) == 319.0
+    nominal_marks_cm = (0.0, 2.5, 5.0, 7.5, 10.0, 12.5)
+    measured_marks_cm = (0.0, 3.0, 5.8, 8.5, 10.7, 12.5)
+    for nominal_cm, measured_cm in zip(
+        nominal_marks_cm,
+        measured_marks_cm,
+    ):
+        old_mark_pixel = x_pixel_for_position_cm(
+            nominal_cm,
+            pinhole_lut,
+        )
+        corrected_cm = x_position_and_scale(
+            old_mark_pixel,
+            measured_lut,
+        )[0]
+        assert abs(corrected_cm - measured_cm) < 0.0002
+        if nominal_cm:
+            negative_pixel = x_pixel_for_position_cm(
+                -nominal_cm,
+                pinhole_lut,
+            )
+            corrected_negative_cm = x_position_and_scale(
+                negative_pixel,
+                measured_lut,
+            )[0]
+            assert abs(corrected_negative_cm + measured_cm) < 0.0002
+    assert x_center_scale(pinhole_lut) == Y_CM_PER_PIXEL
+    assert abs(x_center_scale(measured_lut) - 0.0789) < 0.000000001
+    assert y_position_cm(160.0) == 0.0
+    assert abs(y_position_cm(161.0) - Y_CM_PER_PIXEL) < 0.000000001
+
+    from ball_control import BallStateFeedback
+
+    reference_controller = BallStateFeedback(
+        kp=2.0,
+        kd=3.0,
+        ka=0.0,
+        position_deadband_cm=0.0,
+        velocity_deadband_cm_s=0.0,
+        x_calibration_mode=X_CALIBRATION_MEASURED,
+        reference_position_cm=3.0,
+    )
+    reference_pixel = x_pixel_for_position_cm(5.8, measured_lut)
+    reference_state = {
+        "x": reference_pixel,
+        "y": 160.0,
+        "vx": 10.0,
+        "vy": 0.0,
+        "track_valid": True,
+        "measurement_accepted": True,
+        "predicted": False,
+        "missed_frames": 0,
+        "measurement_age_ms": 0,
+    }
+    reference_candidate = {"edge_clipped": False}
+    reference_feedback = reference_controller.update(
+        reference_state,
+        reference_candidate,
+        1000,
+    )
+    expected_feedback = -(
+        2.0 * (reference_feedback["position_cm"] - 3.0)
+        + 3.0 * reference_feedback["velocity_cm_s"]
+    )
+    assert abs(reference_feedback["position_cm"] - 5.8) < 0.0001
+    assert abs(reference_feedback["position_error_cm"] - 2.8) < 0.0001
+    assert abs(
+        reference_feedback["feedback_acceleration_cm_s2"]
+        - expected_feedback
+    ) < 0.0001
+    assert reference_controller.set_reference_position_cm(-2.5) == -2.5
+    try:
+        reference_controller.set_reference_position_cm(12.6)
+        raise AssertionError("out-of-range reference must fail")
+    except ValueError:
+        pass
+
     candidate = {
         "confidence": 0.92,
         "center_x": 123,
@@ -310,7 +469,17 @@ def run_self_test():
     }
     feedback = {
         "position_cm": -3.25,
+        "reference_position_cm": 1.25,
+        "position_error_cm": -4.50,
+        "reference_velocity_cm_s": 0.0,
+        "reference_acceleration_cm_s2": 0.0,
+        "reference_state_flags": (
+            BALL_REFERENCE_FLAG_VALID
+            | BALL_REFERENCE_FLAG_SOURCE_PRESET
+        ),
+        "position_y_cm": 0.75,
         "velocity_cm_s": 12.3,
+        "velocity_y_cm_s": -1.4,
         "acceleration_cm_s2": 18.4,
         "feedback_acceleration_cm_s2": -36.6,
         "kp": 16.0,
@@ -329,6 +498,55 @@ def run_self_test():
     second = encode_ball_state_frame(
         8, 1033, flags, state, candidate, 18, feedback
     )
+    assert len(first) == 64
+    assert first[4] == 6
+    assert _read_u16(first, 6) == 48
+    assert first[56:62] == b"\x00\x00\x00\x00\x00\x00"
+    schema5_candidate = bytearray(first)
+    schema5_candidate[4] = 5
+    crc_offset = UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE
+    schema5_crc = crc16_ccitt_false(schema5_candidate, 2, crc_offset)
+    schema5_candidate[crc_offset] = schema5_crc & 0xFF
+    schema5_candidate[crc_offset + 1] = (schema5_crc >> 8) & 0xFF
+    assert not validate_ball_state_frame(schema5_candidate)
+    assert not validate_ball_state_frame(first[:48])
+    reserved_candidate = bytearray(first)
+    reserved_candidate[56] = 1
+    reserved_crc = crc16_ccitt_false(reserved_candidate, 2, crc_offset)
+    reserved_candidate[crc_offset] = reserved_crc & 0xFF
+    reserved_candidate[crc_offset + 1] = (reserved_crc >> 8) & 0xFF
+    assert not validate_ball_state_frame(reserved_candidate)
+    multiple_sources_candidate = bytearray(first)
+    multiple_sources_candidate[UART_HEADER_SIZE + 40] = (
+        BALL_REFERENCE_FLAG_VALID
+        | BALL_REFERENCE_FLAG_SOURCE_PRESET
+        | BALL_REFERENCE_FLAG_SOURCE_MCU
+    )
+    multiple_sources_candidate[UART_HEADER_SIZE + 41] = 0
+    multiple_sources_crc = crc16_ccitt_false(
+        multiple_sources_candidate,
+        2,
+        crc_offset,
+    )
+    multiple_sources_candidate[crc_offset] = multiple_sources_crc & 0xFF
+    multiple_sources_candidate[crc_offset + 1] = (
+        multiple_sources_crc >> 8
+    ) & 0xFF
+    assert not validate_ball_state_frame(multiple_sources_candidate)
+    unknown_reference_flag_candidate = bytearray(first)
+    unknown_reference_flag_candidate[UART_HEADER_SIZE + 40] |= 0x20
+    unknown_reference_flag_crc = crc16_ccitt_false(
+        unknown_reference_flag_candidate,
+        2,
+        crc_offset,
+    )
+    unknown_reference_flag_candidate[crc_offset] = (
+        unknown_reference_flag_crc & 0xFF
+    )
+    unknown_reference_flag_candidate[crc_offset + 1] = (
+        unknown_reference_flag_crc >> 8
+    ) & 0xFF
+    assert not validate_ball_state_frame(unknown_reference_flag_candidate)
 
     parser = BallStreamParser()
     decoded_frames = []
@@ -347,9 +565,21 @@ def run_self_test():
     assert parser.discarded_bytes == 2
     decoded = decode_ball_state_frame(decoded_frames[0])
     assert decoded["position_cm"] == -3.25
+    assert decoded["physical_x_cm"] == -3.25
+    assert decoded["physical_y_cm"] == 0.75
     assert decoded["velocity_cm_s"] == 12.3
+    assert decoded["physical_vx_cm_s"] == 12.3
+    assert decoded["physical_vy_cm_s"] == -1.4
     assert decoded["acceleration_cm_s2"] == 18.4
     assert decoded["feedback_acceleration_cm_s2"] == -36.6
+    assert decoded["reference_position_cm"] == 1.25
+    assert decoded["position_error_cm"] == -4.5
+    assert decoded["reference_velocity_cm_s"] == 0.0
+    assert decoded["reference_acceleration_cm_s2"] == 0.0
+    assert decoded["reference_state_flags"] == (
+        BALL_REFERENCE_FLAG_VALID | BALL_REFERENCE_FLAG_SOURCE_PRESET
+    )
+    assert decoded["reserved_extension"] == b"\x00" * 6
     assert decoded["kp"] == 16.0
     assert decoded["kd"] == 7.2
     assert decoded["ka"] == 0.05
@@ -617,7 +847,7 @@ def run_k230_debug():
 
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Receive and decode K230 proj2 48-byte steel-ball frames."
+        description="Receive and decode K230 proj2 64-byte steel-ball frames."
     )
     parser.add_argument("--port", help="serial port, for example COM7 or /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE)

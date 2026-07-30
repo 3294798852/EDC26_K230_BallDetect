@@ -1,8 +1,8 @@
-"""Fixed 48-byte UART protocol for visual ball state and feedback.
+"""Fixed 64-byte UART protocol for visual ball state and feedback.
 
-Schema 4 carries only camera-derived image/physical state and the bounded
-state-feedback term. Reference generation, car feedforward, beam-angle inversion
-and the measured-angle inner loop belong to the MCU.
+Schema 6 preserves the schema-5 base field offsets and appends the active
+reference state. Car feedforward, beam-angle inversion and the measured-angle
+inner loop belong to the MCU.
 """
 
 
@@ -12,9 +12,9 @@ UART_PROTOCOL_VERSION = 1
 UART_MSG_VISION_EVENT = 0x02
 UART_FRAME_FLAG_REALTIME = 1 << 0
 
-BALL_STATE_SCHEMA_VERSION = 4
+BALL_STATE_SCHEMA_VERSION = 6
 BALL_STATE_KIND = 5
-BALL_STATE_PAYLOAD_SIZE = 32
+BALL_STATE_PAYLOAD_SIZE = 48
 UART_HEADER_SIZE = 14
 UART_CRC_SIZE = 2
 BALL_STATE_FRAME_SIZE = (
@@ -30,8 +30,24 @@ BALL_FLAG_OUTLIER_REJECTED = 1 << 5
 BALL_FLAG_EDGE_CLIPPED = 1 << 6
 BALL_FLAG_FEEDBACK_SATURATED = 1 << 7
 
+BALL_REFERENCE_FLAG_VALID = 1 << 0
+BALL_REFERENCE_FLAG_SOURCE_PRESET = 1 << 1
+BALL_REFERENCE_FLAG_SOURCE_ALGORITHM = 1 << 2
+BALL_REFERENCE_FLAG_SOURCE_MCU = 1 << 3
+BALL_REFERENCE_FLAG_SLEW_ACTIVE = 1 << 4
+BALL_REFERENCE_SOURCE_MASK = (
+    BALL_REFERENCE_FLAG_SOURCE_PRESET
+    | BALL_REFERENCE_FLAG_SOURCE_ALGORITHM
+    | BALL_REFERENCE_FLAG_SOURCE_MCU
+)
+BALL_REFERENCE_KNOWN_MASK = (
+    BALL_REFERENCE_FLAG_VALID
+    | BALL_REFERENCE_SOURCE_MASK
+    | BALL_REFERENCE_FLAG_SLEW_ACTIVE
+)
+
 BALL_COORD_SCALE = 100
-BALL_VELOCITY_SCALE = 10
+BALL_PHYSICAL_XY_VELOCITY_SCALE = 10
 BALL_POSITION_CM_SCALE = 100
 BALL_PHYSICAL_VELOCITY_SCALE = 10
 BALL_ACCELERATION_SCALE = 10
@@ -39,6 +55,9 @@ BALL_FEEDBACK_SCALE = 10
 BALL_GAIN_SCALE = 100
 BALL_DERIVATIVE_GAIN_SCALE = 10
 BALL_ACCEL_GAIN_SCALE = 100
+BALL_REFERENCE_POSITION_SCALE = 100
+BALL_REFERENCE_VELOCITY_SCALE = 10
+BALL_REFERENCE_ACCELERATION_SCALE = 10
 
 
 def _clamp(value, low, high):
@@ -121,7 +140,7 @@ def encode_ball_state_frame(
     inference_ms=0,
     feedback=None,
 ):
-    """Encode one fixed 48-byte visual-state/feedback frame."""
+    """Encode one fixed 64-byte schema-6 visual feedback frame."""
     frame = bytearray(BALL_STATE_FRAME_SIZE)
     frame[0] = UART_SYNC_0
     frame[1] = UART_SYNC_1
@@ -156,29 +175,38 @@ def encode_ball_state_frame(
         payload + 6,
         _clamp(_round_int(_candidate_value(candidate, "center_y", 0)), 0, 0xFFFF),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 8,
         _clamp(
-            _round_int(_state_value(state, "x", 0.0) * BALL_COORD_SCALE),
-            0,
-            0xFFFF,
+            _round_int(
+                _state_value(feedback, "position_cm", 0.0)
+                * BALL_COORD_SCALE
+            ),
+            -32768,
+            32767,
         ),
     )
-    _put_u16(
+    _put_i16(
         frame,
         payload + 10,
         _clamp(
-            _round_int(_state_value(state, "y", 0.0) * BALL_COORD_SCALE),
-            0,
-            0xFFFF,
+            _round_int(
+                _state_value(feedback, "position_y_cm", 0.0)
+                * BALL_COORD_SCALE
+            ),
+            -32768,
+            32767,
         ),
     )
     _put_i16(
         frame,
         payload + 12,
         _clamp(
-            _round_int(_state_value(state, "vx", 0.0) * BALL_VELOCITY_SCALE),
+            _round_int(
+                _state_value(feedback, "velocity_cm_s", 0.0)
+                * BALL_PHYSICAL_XY_VELOCITY_SCALE
+            ),
             -32768,
             32767,
         ),
@@ -187,7 +215,10 @@ def encode_ball_state_frame(
         frame,
         payload + 14,
         _clamp(
-            _round_int(_state_value(state, "vy", 0.0) * BALL_VELOCITY_SCALE),
+            _round_int(
+                _state_value(feedback, "velocity_y_cm_s", 0.0)
+                * BALL_PHYSICAL_XY_VELOCITY_SCALE
+            ),
             -32768,
             32767,
         ),
@@ -274,6 +305,67 @@ def encode_ball_state_frame(
         0,
         255,
     )
+    _put_i16(
+        frame,
+        payload + 32,
+        _clamp(
+            _round_int(
+                _state_value(feedback, "reference_position_cm", 0.0)
+                * BALL_REFERENCE_POSITION_SCALE
+            ),
+            -32768,
+            32767,
+        ),
+    )
+    _put_i16(
+        frame,
+        payload + 34,
+        _clamp(
+            _round_int(
+                _state_value(feedback, "position_error_cm", 0.0)
+                * BALL_REFERENCE_POSITION_SCALE
+            ),
+            -32768,
+            32767,
+        ),
+    )
+    _put_i16(
+        frame,
+        payload + 36,
+        _clamp(
+            _round_int(
+                _state_value(feedback, "reference_velocity_cm_s", 0.0)
+                * BALL_REFERENCE_VELOCITY_SCALE
+            ),
+            -32768,
+            32767,
+        ),
+    )
+    _put_i16(
+        frame,
+        payload + 38,
+        _clamp(
+            _round_int(
+                _state_value(
+                    feedback,
+                    "reference_acceleration_cm_s2",
+                    0.0,
+                ) * BALL_REFERENCE_ACCELERATION_SCALE
+            ),
+            -32768,
+            32767,
+        ),
+    )
+    _put_u16(
+        frame,
+        payload + 40,
+        _clamp(
+            int(_state_value(feedback, "reference_state_flags", 0)),
+            0,
+            0xFFFF,
+        ),
+    )
+    # Payload 42..47 is reserved and remains zero from bytearray allocation.
 
     crc_offset = UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE
     _put_u16(frame, crc_offset, crc16_ccitt_false(frame, 2, crc_offset))
@@ -297,6 +389,22 @@ def validate_ball_state_frame(frame):
         return False
     if int(frame[UART_HEADER_SIZE]) != BALL_STATE_KIND:
         return False
+    reference_flags = _get_u16(frame, UART_HEADER_SIZE + 40)
+    if reference_flags & ~BALL_REFERENCE_KNOWN_MASK:
+        return False
+    source_flags = reference_flags & BALL_REFERENCE_SOURCE_MASK
+    if reference_flags & BALL_REFERENCE_FLAG_VALID:
+        if source_flags not in (
+            BALL_REFERENCE_FLAG_SOURCE_PRESET,
+            BALL_REFERENCE_FLAG_SOURCE_ALGORITHM,
+            BALL_REFERENCE_FLAG_SOURCE_MCU,
+        ):
+            return False
+    elif reference_flags != 0:
+        return False
+    for offset in range(UART_HEADER_SIZE + 42, UART_HEADER_SIZE + 48):
+        if int(frame[offset]) != 0:
+            return False
     crc_offset = UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE
     return _get_u16(frame, crc_offset) == crc16_ccitt_false(
         frame,
@@ -306,7 +414,7 @@ def validate_ball_state_frame(frame):
 
 
 def decode_ball_state_frame(frame):
-    """Validate and decode one schema-4 frame for host diagnostics."""
+    """Validate and decode one schema-6 frame for host diagnostics."""
     if not validate_ball_state_frame(frame):
         raise ValueError("invalid visual-ball UART frame")
     payload = UART_HEADER_SIZE
@@ -320,10 +428,14 @@ def decode_ball_state_frame(frame):
         "missed_frames": int(frame[payload + 3]),
         "raw_x": _get_u16(frame, payload + 4),
         "raw_y": _get_u16(frame, payload + 6),
-        "filtered_x": _get_u16(frame, payload + 8) / float(BALL_COORD_SCALE),
-        "filtered_y": _get_u16(frame, payload + 10) / float(BALL_COORD_SCALE),
-        "vx": _get_i16(frame, payload + 12) / float(BALL_VELOCITY_SCALE),
-        "vy": _get_i16(frame, payload + 14) / float(BALL_VELOCITY_SCALE),
+        "physical_x_cm": _get_i16(frame, payload + 8)
+        / float(BALL_COORD_SCALE),
+        "physical_y_cm": _get_i16(frame, payload + 10)
+        / float(BALL_COORD_SCALE),
+        "physical_vx_cm_s": _get_i16(frame, payload + 12)
+        / float(BALL_PHYSICAL_XY_VELOCITY_SCALE),
+        "physical_vy_cm_s": _get_i16(frame, payload + 14)
+        / float(BALL_PHYSICAL_XY_VELOCITY_SCALE),
         "position_cm": _get_i16(frame, payload + 16)
         / float(BALL_POSITION_CM_SCALE),
         "velocity_cm_s": _get_i16(frame, payload + 18)
@@ -332,11 +444,23 @@ def decode_ball_state_frame(frame):
         / float(BALL_ACCELERATION_SCALE),
         "feedback_acceleration_cm_s2": _get_i16(frame, payload + 22)
         / float(BALL_FEEDBACK_SCALE),
+        "detector_ms": _get_u16(frame, payload + 24),
+        # Compatibility alias for existing PC/MCU-side Python tooling.
         "inference_ms": _get_u16(frame, payload + 24),
         "measurement_age_ms": _get_u16(frame, payload + 26),
         "kp": _get_u16(frame, payload + 28) / float(BALL_GAIN_SCALE),
         "kd": int(frame[payload + 30])
         / float(BALL_DERIVATIVE_GAIN_SCALE),
         "ka": int(frame[payload + 31]) / float(BALL_ACCEL_GAIN_SCALE),
+        "reference_position_cm": _get_i16(frame, payload + 32)
+        / float(BALL_REFERENCE_POSITION_SCALE),
+        "position_error_cm": _get_i16(frame, payload + 34)
+        / float(BALL_REFERENCE_POSITION_SCALE),
+        "reference_velocity_cm_s": _get_i16(frame, payload + 36)
+        / float(BALL_REFERENCE_VELOCITY_SCALE),
+        "reference_acceleration_cm_s2": _get_i16(frame, payload + 38)
+        / float(BALL_REFERENCE_ACCELERATION_SCALE),
+        "reference_state_flags": _get_u16(frame, payload + 40),
+        "reserved_extension": bytes(frame[payload + 42:payload + 48]),
         "crc16": _get_u16(frame, BALL_STATE_FRAME_SIZE - UART_CRC_SIZE),
     }

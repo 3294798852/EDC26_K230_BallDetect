@@ -2,7 +2,7 @@
 
 This entry intentionally has no command handshake or task supervisor.  It
 starts the camera, detector, constrained motion filter, UART and lightweight
-overlay once, then continuously publishes the newest 48-byte state frame.
+overlay once, then continuously publishes the newest 64-byte state frame.
 """
 
 import gc
@@ -30,7 +30,12 @@ PipeMotionFilter = None
 normalize_postprocessed_ball_candidates = None
 BallStateFeedback = None
 RoiDarkBlobDetector = None
+EdgeHoughCircleDetector = None
 encode_ball_state_frame = None
+x_pixel_for_position_cm = None
+get_x_calibration_lut = None
+X_CALIBRATION_MEASURED = "measured_distortion"
+X_CALIBRATION_PINHOLE = "pinhole"
 
 BALL_FLAG_RAW_DETECTED = 0x01
 BALL_FLAG_MEASUREMENT_ACCEPTED = 0x02
@@ -40,7 +45,9 @@ BALL_FLAG_FEEDBACK_VALID = 0x10
 BALL_FLAG_OUTLIER_REJECTED = 0x20
 BALL_FLAG_EDGE_CLIPPED = 0x40
 BALL_FLAG_FEEDBACK_SATURATED = 0x80
-BALL_STATE_FRAME_SIZE = 48
+BALL_STATE_FRAME_SIZE = 64
+BALL_REFERENCE_FLAG_VALID = 0x0001
+BALL_REFERENCE_FLAG_SOURCE_PRESET = 0x0002
 
 _BOOT_IMPORT_ERROR = None
 _BOOT_IMPORT_STAGE = None
@@ -79,6 +86,8 @@ try:
         BALL_FLAG_PREDICTED,
         BALL_FLAG_RAW_DETECTED,
         BALL_FLAG_TRACK_VALID,
+        BALL_REFERENCE_FLAG_SOURCE_PRESET,
+        BALL_REFERENCE_FLAG_VALID,
         BALL_STATE_FRAME_SIZE,
         encode_ball_state_frame,
     )
@@ -89,18 +98,27 @@ try:
     )
     _BOOT_IMPORT_STAGE = "import_ball_control"
     from ball_control import BallStateFeedback
+    _BOOT_IMPORT_STAGE = "import_ball_calibration"
+    from ball_calibration import (
+        X_CALIBRATION_MEASURED,
+        X_CALIBRATION_PINHOLE,
+        get_x_calibration_lut,
+        x_pixel_for_position_cm,
+    )
     _BOOT_IMPORT_STAGE = "import_ball_roi_detector"
     from ball_roi_detector import RoiDarkBlobDetector
+    _BOOT_IMPORT_STAGE = "import_ball_edge_hough_detector"
+    from ball_edge_hough_detector import EdgeHoughCircleDetector
     _BOOT_IMPORT_STAGE = None
 except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.14"
+APP_VERSION = "proj2-1.28"
 
-# Select one detector backend here: "yolov8n", "yolov8", or "roi_blob".
+# Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
-MODEL_BACKEND = "roi_blob"
+MODEL_BACKEND = "edge_hough"
 MODEL_BACKENDS = {
     "yolov8n": {
         "display_name": "YOLOv8n",
@@ -116,6 +134,10 @@ MODEL_BACKENDS = {
         "display_name": "ROI dark blob",
         "native_roi": True,
     },
+    "edge_hough": {
+        "display_name": "Canny Hough circle",
+        "native_hough": True,
+    },
 }
 MODEL_INPUT_WIDTH = 320
 MODEL_INPUT_HEIGHT = 320
@@ -127,22 +149,50 @@ POSTPROCESS_MAX_BOXES = 4
 ROI_HALF_WIDTH_PX = 22.0
 ROI_THRESHOLD_SAMPLE_HALF_WIDTH_PX = 10.0
 ROI_ENDPOINT_MARGIN_PX = 4.0
-ROI_MIN_DIAMETER_PX = 4.0
+ROI_MIN_DIAMETER_PX = 3.0
 ROI_MAX_DIAMETER_PX = 26.0
 ROI_TARGET_DIAMETER_PX = 11.0
-ROI_MIN_PIXELS = 12
-ROI_THRESHOLD_RATIO = 0.60
+ROI_MIN_PIXELS = 6
+ROI_FRAGMENT_MIN_PIXELS = 3
+ROI_FRAGMENT_MERGE_GAP_PX = 3.0
+ROI_TRACKED_MIN_ASPECT_RATIO = 0.16
+ROI_TRACKED_MIN_FILL_RATIO = 0.08
+ROI_MOTION_BLUR_SECONDS = 0.025
+ROI_MOTION_BLUR_MIN_EXTRA_PX = 8.0
+ROI_MOTION_BLUR_MAX_EXTRA_PX = 24.0
+ROI_THRESHOLD_RATIO = 0.68
 ROI_THRESHOLD_L_MIN = 20
 ROI_THRESHOLD_L_MAX = 62
 ROI_THRESHOLD_UPDATE_FRAMES = 6
 
-# Visual-to-physical calibration. Positive position points from the negative
-# endpoint to the positive endpoint. Values remain provisional until measured.
+# Native Canny-edge Hough-circle backend. cv_lite performs both expensive
+# stages in native code; Python only filters a bounded candidate list.
+# Keep the expensive Hough image crop wider than the logical pipe-center gate.
+# With the current horizontal axis this produces an exact 320x80 ROI, while
+# the separate 28 px gate rejects most pipe-wall/background circles.
+HOUGH_CROP_HALF_WIDTH_PX = 40.0
+HOUGH_AXIS_CENTER_LIMIT_PX = 28.0
+HOUGH_ENDPOINT_MARGIN_PX = 4.0
+HOUGH_DP = 1
+HOUGH_MIN_CENTER_DISTANCE_PX = 6
+HOUGH_CANNY_HIGH_THRESHOLD = 80
+HOUGH_ACCUMULATOR_THRESHOLD = 9
+HOUGH_MIN_RADIUS_PX = 2
+HOUGH_MAX_RADIUS_PX = 14
+HOUGH_TARGET_RADIUS_PX = 5.5
+HOUGH_MAX_RAW_CIRCLES = 24
+
+# Image-space pipe geometry used only by detection and pixel-domain tracking.
+# Physical conversion is isolated in ball_calibration.py after tracking.
 PIPE_NEGATIVE_END_X_PX = 10.0
 PIPE_NEGATIVE_END_Y_PX = 160.0
 PIPE_POSITIVE_END_X_PX = 310.0
 PIPE_POSITIVE_END_Y_PX = 160.0
-PIPE_LENGTH_CM = 25.0
+
+# Physical-coordinate calibration used by position, velocity, acceleration,
+# feedback, Y center scale and the optional screen ruler. "measured_distortion"
+# is the current physical-ruler fit; "pinhole" preserves the original model.
+X_CALIBRATION_MODE = X_CALIBRATION_MEASURED
 
 # K230 publishes only its camera-derived state-feedback term. Physical position
 # and velocity pass through continuous soft deadbands before their gains.
@@ -150,13 +200,46 @@ FEEDBACK_KP = 16.0
 FEEDBACK_KD = 7.2
 FEEDBACK_KA = 0.0
 FEEDBACK_ACCEL_LIMIT_CM_S2 = 250.0
+# Absolute calibrated X coordinate used as the ball equilibrium origin.
+# A future validated algorithm/MCU command may call
+# BallStateFeedback.set_reference_position_cm() to update it at runtime.
+FEEDBACK_REFERENCE_POSITION_CM = 0.0
 TRACK_HOLD_MAX_FRAMES = 8
 TRACK_HOLD_MAX_MS = 300
 
-CAMERA_FPS = 30
+# Fixed-pipe asymmetric tracker. Axial motion gets a fast response outside a
+# small noise band; lateral position and apparent diameter remain strongly
+# smoothed because the camera and pipe geometry are fixed.
+TRACK_AXIAL_FAST_ALPHA = 0.96
+TRACK_AXIAL_QUIET_ALPHA = 0.18
+TRACK_AXIAL_RESPONSE_START_PX = 0.25
+TRACK_AXIAL_RESPONSE_FULL_PX = 1.50
+TRACK_VELOCITY_BETA = 0.30
+TRACK_VELOCITY_FAST_BETA = 0.85
+TRACK_VELOCITY_NOISE_PX = 0.90
+TRACK_VELOCITY_QUIET_DECAY = 0.35
+TRACK_VELOCITY_QUIET_TIMEOUT_MS = 120
+TRACK_LATERAL_ALPHA = 0.08
+TRACK_DIAMETER_ALPHA = 0.08
+TRACK_DIAMETER_MAX_STEP_PX = 1.0
+
+CAMERA_FPS = 60
+# Leave as None to preserve the camera firmware's original exposure behavior.
+# Set a positive value in microseconds (for example 5000) to disable automatic
+# exposure and use a fixed exposure time. Shorter exposure reduces motion blur
+# but needs more illumination. This is sensor exposure, not image brightening.
+CAMERA_EXPOSURE_US = None
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
-OVERLAY_INTERVAL_MS = 100
+# Optional one-shot physical X ruler on a dedicated OSD layer. It does not
+# redraw in the frame loop. Disable it to retain the original single-OSD memory
+# footprint. Tick spacing supports 0.5 cm or 1.0 cm; labels stay at 2.5 cm.
+SHOW_PHYSICAL_X_RULER = True
+PHYSICAL_X_RULER_TICK_CM = 0.5
+PHYSICAL_X_RULER_Y = 320
+# Draw close to the camera frame rate. The former 100 ms interval made a
+# correctly updated 30 FPS state look about three frames late on screen.
+OVERLAY_INTERVAL_MS = 30
 PC_DEBUG_INTERVAL_MS = 500
 GC_INTERVAL_FRAMES = 60
 MAX_CONSECUTIVE_FRAME_ERRORS = 3
@@ -177,6 +260,9 @@ COLOR_BAD = (255, 255, 40, 40)
 COLOR_RAW = (255, 255, 180, 0)
 COLOR_FILTERED = (255, 0, 255, 255)
 COLOR_AXIS = (255, 80, 160, 255)
+COLOR_RULER = (255, 255, 255, 255)
+COLOR_RULER_MAJOR = (255, 0, 255, 255)
+COLOR_RULER_SHADOW = (180, 0, 0, 0)
 STATUS_PANEL_HEIGHT = 230
 
 
@@ -393,11 +479,12 @@ def _selected_model_config():
     config = MODEL_BACKENDS.get(MODEL_BACKEND)
     if config is None:
         raise RuntimeError(
-            "unknown MODEL_BACKEND {}; use yolov8n, yolov8 or roi_blob".format(
+            "unknown MODEL_BACKEND {}; use yolov8n, yolov8, roi_blob or "
+            "edge_hough".format(
                 MODEL_BACKEND
             )
         )
-    if config.get("native_roi"):
+    if config.get("native_roi") or config.get("native_hough"):
         return config
     if not config.get("path") or not config.get("expected_output"):
         raise RuntimeError("incomplete model backend: " + MODEL_BACKEND)
@@ -406,7 +493,7 @@ def _selected_model_config():
 
 def _verify_model():
     config = _selected_model_config()
-    if config.get("native_roi"):
+    if config.get("native_roi") or config.get("native_hough"):
         return
     model_path = config["path"]
     try:
@@ -443,6 +530,7 @@ class BallDetector:
         self.preprocess_ms = 0
         self.kpu_ms = 0
         self.postprocess_ms = 0
+        self.timing_labels = ("ai2d", "kpu", "post")
         self.last_detection_count = 0
         try:
             self.kpu = nn.kpu()
@@ -584,6 +672,27 @@ class BallDetector:
 
 def _create_detector():
     config = _selected_model_config()
+    if config.get("native_hough"):
+        return EdgeHoughCircleDetector(
+            frame_width=MODEL_INPUT_WIDTH,
+            frame_height=MODEL_INPUT_HEIGHT,
+            negative_end_x_px=PIPE_NEGATIVE_END_X_PX,
+            negative_end_y_px=PIPE_NEGATIVE_END_Y_PX,
+            positive_end_x_px=PIPE_POSITIVE_END_X_PX,
+            positive_end_y_px=PIPE_POSITIVE_END_Y_PX,
+            crop_half_width_px=HOUGH_CROP_HALF_WIDTH_PX,
+            axis_center_limit_px=HOUGH_AXIS_CENTER_LIMIT_PX,
+            endpoint_margin_px=HOUGH_ENDPOINT_MARGIN_PX,
+            dp=HOUGH_DP,
+            min_center_distance_px=HOUGH_MIN_CENTER_DISTANCE_PX,
+            canny_high_threshold=HOUGH_CANNY_HIGH_THRESHOLD,
+            accumulator_threshold=HOUGH_ACCUMULATOR_THRESHOLD,
+            min_radius_px=HOUGH_MIN_RADIUS_PX,
+            max_radius_px=HOUGH_MAX_RADIUS_PX,
+            target_radius_px=HOUGH_TARGET_RADIUS_PX,
+            max_raw_circles=HOUGH_MAX_RAW_CIRCLES,
+            max_candidates=POSTPROCESS_MAX_BOXES,
+        )
     if config.get("native_roi"):
         return RoiDarkBlobDetector(
             frame_width=MODEL_INPUT_WIDTH,
@@ -599,6 +708,13 @@ def _create_detector():
             max_diameter_px=ROI_MAX_DIAMETER_PX,
             target_diameter_px=ROI_TARGET_DIAMETER_PX,
             min_pixels=ROI_MIN_PIXELS,
+            fragment_min_pixels=ROI_FRAGMENT_MIN_PIXELS,
+            fragment_merge_gap_px=ROI_FRAGMENT_MERGE_GAP_PX,
+            tracked_min_aspect_ratio=ROI_TRACKED_MIN_ASPECT_RATIO,
+            tracked_min_fill_ratio=ROI_TRACKED_MIN_FILL_RATIO,
+            motion_blur_seconds=ROI_MOTION_BLUR_SECONDS,
+            motion_blur_min_extra_px=ROI_MOTION_BLUR_MIN_EXTRA_PX,
+            motion_blur_max_extra_px=ROI_MOTION_BLUR_MAX_EXTRA_PX,
             threshold_ratio=ROI_THRESHOLD_RATIO,
             threshold_l_min=ROI_THRESHOLD_L_MIN,
             threshold_l_max=ROI_THRESHOLD_L_MAX,
@@ -609,7 +725,7 @@ def _create_detector():
 
 
 class CameraDisplay:
-    """Own camera channel 0 video, channel 2 AI input and one OSD layer."""
+    """Own camera video, detector input and dynamic/static OSD layers."""
 
     def __init__(self):
         self.sensor = None
@@ -617,14 +733,28 @@ class CameraDisplay:
         self.display_initialized = False
         self.media_initialized = False
         self.sensor_running = False
-        self.native_roi_input = bool(
-            _selected_model_config().get("native_roi")
+        self.ruler_drawn = False
+        self.exposure_us = None
+        self.x_calibration_lut = get_x_calibration_lut(X_CALIBRATION_MODE)
+        config = _selected_model_config()
+        self.native_image_input = bool(
+            config.get("native_roi") or config.get("native_hough")
         )
 
     def start(self):
         sensor = Sensor(fps=CAMERA_FPS)
         self.sensor = sensor
         sensor.reset()
+        if CAMERA_EXPOSURE_US is not None:
+            try:
+                exposure_us = int(CAMERA_EXPOSURE_US)
+            except Exception:
+                raise ValueError("CAMERA_EXPOSURE_US must be None or positive")
+            if exposure_us <= 0:
+                raise ValueError("CAMERA_EXPOSURE_US must be positive")
+            sensor.auto_exposure(False)
+            sensor.exposure(exposure_us)
+            self.exposure_us = exposure_us
         sensor.set_framesize(
             w=DISPLAY_WIDTH,
             h=DISPLAY_HEIGHT,
@@ -641,7 +771,7 @@ class CameraDisplay:
         )
         sensor.set_pixformat(
             PIXEL_FORMAT_RGB_565
-            if self.native_roi_input
+            if self.native_image_input
             else PIXEL_FORMAT_RGB_888_PLANAR,
             chn=CAM_CHN_ID_2,
         )
@@ -660,7 +790,7 @@ class CameraDisplay:
             Display.ST7701,
             width=DISPLAY_WIDTH,
             height=DISPLAY_HEIGHT,
-            osd_num=1,
+            osd_num=2 if SHOW_PHYSICAL_X_RULER else 1,
             to_ide=True,
         )
         self.display_initialized = True
@@ -668,14 +798,21 @@ class CameraDisplay:
         self.media_initialized = True
         sensor.run()
         self.sensor_running = True
+        if SHOW_PHYSICAL_X_RULER:
+            self._draw_physical_x_ruler()
 
     def get_frame(self):
         frame = self.sensor.snapshot(chn=CAM_CHN_ID_2)
         if frame is None:
             raise RuntimeError("camera returned no detector frame")
-        if self.native_roi_input:
+        if self.native_image_input:
             return frame
         return frame.to_numpy_ref()
+
+    def exposure_text(self):
+        if self.exposure_us is None:
+            return "EXP=SYS"
+        return "EXP={}us".format(int(self.exposure_us))
 
     @staticmethod
     def _screen_x(value):
@@ -684,6 +821,141 @@ class CameraDisplay:
     @staticmethod
     def _screen_y(value):
         return int(float(value) * DISPLAY_HEIGHT / MODEL_INPUT_HEIGHT)
+
+    def _physical_x_screen(self, position_cm):
+        pixel_x = x_pixel_for_position_cm(
+            position_cm,
+            self.x_calibration_lut,
+        )
+        screen_x = int(
+            pixel_x * DISPLAY_WIDTH / MODEL_INPUT_WIDTH + 0.5
+        )
+        if float(position_cm) <= -12.5:
+            return 0
+        if float(position_cm) >= 12.5:
+            return DISPLAY_WIDTH - 1
+        if screen_x < 0:
+            return 0
+        if screen_x >= DISPLAY_WIDTH:
+            return DISPLAY_WIDTH - 1
+        return screen_x
+
+    @staticmethod
+    def _ruler_label(value_x10):
+        if value_x10 == 0:
+            return "0"
+        sign = "-" if value_x10 < 0 else ""
+        magnitude = -value_x10 if value_x10 < 0 else value_x10
+        whole = magnitude // 10
+        tenth = magnitude % 10
+        if tenth:
+            return "{}{}.{}".format(sign, whole, tenth)
+        return "{}{}".format(sign, whole)
+
+    def _draw_physical_x_ruler(self):
+        tick_x10 = int(float(PHYSICAL_X_RULER_TICK_CM) * 10.0 + 0.5)
+        if tick_x10 not in (5, 10):
+            raise ValueError(
+                "PHYSICAL_X_RULER_TICK_CM must be 0.5 or 1.0"
+            )
+        ruler_y = int(PHYSICAL_X_RULER_Y)
+        if ruler_y < 16 or ruler_y > DISPLAY_HEIGHT - 40:
+            raise ValueError("PHYSICAL_X_RULER_Y outside drawable range")
+
+        ruler = image.Image(
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+            image.ARGB8888,
+        )
+        ruler.clear()
+        left_x = self._physical_x_screen(-12.5)
+        right_x = self._physical_x_screen(12.5)
+        ruler.draw_line(
+            left_x,
+            ruler_y,
+            right_x,
+            ruler_y,
+            color=COLOR_RULER_SHADOW,
+            thickness=3,
+        )
+        ruler.draw_line(
+            left_x,
+            ruler_y,
+            right_x,
+            ruler_y,
+            color=COLOR_RULER,
+            thickness=1,
+        )
+
+        # A 1 cm grid is zero-centered; endpoint labels still mark +/-12.5 cm.
+        minor_value_x10 = -125 if tick_x10 == 5 else -120
+        while minor_value_x10 <= 125:
+            screen_x = self._physical_x_screen(minor_value_x10 / 10.0)
+            ruler.draw_line(
+                screen_x,
+                ruler_y - 4,
+                screen_x,
+                ruler_y + 5,
+                color=COLOR_RULER_SHADOW,
+                thickness=3,
+            )
+            ruler.draw_line(
+                screen_x,
+                ruler_y - 4,
+                screen_x,
+                ruler_y + 5,
+                color=COLOR_RULER,
+                thickness=1,
+            )
+            minor_value_x10 += tick_x10
+
+        label_value_x10 = -125
+        while label_value_x10 <= 125:
+            screen_x = self._physical_x_screen(label_value_x10 / 10.0)
+            ruler.draw_line(
+                screen_x,
+                ruler_y - 8,
+                screen_x,
+                ruler_y + 9,
+                color=COLOR_RULER_SHADOW,
+                thickness=3,
+            )
+            ruler.draw_line(
+                screen_x,
+                ruler_y - 8,
+                screen_x,
+                ruler_y + 9,
+                color=COLOR_RULER_MAJOR,
+                thickness=2,
+            )
+            label = self._ruler_label(label_value_x10)
+            estimated_width = len(label) * 9
+            label_x = screen_x - estimated_width // 2
+            if label_x < 1:
+                label_x = 1
+            max_label_x = DISPLAY_WIDTH - estimated_width - 1
+            if label_x > max_label_x:
+                label_x = max_label_x
+            ruler.draw_string_advanced(
+                label_x + 1,
+                ruler_y + 12,
+                16,
+                label,
+                color=COLOR_RULER_SHADOW,
+            )
+            ruler.draw_string_advanced(
+                label_x,
+                ruler_y + 11,
+                16,
+                label,
+                color=COLOR_RULER_MAJOR,
+            )
+            label_value_x10 += 25
+
+        Display.show_image(ruler, 0, 0, Display.LAYER_OSD0)
+        self.ruler_drawn = True
+        ruler = None
+        gc.collect()
 
     def _draw_text(self, row, text, color):
         self.osd.draw_string_advanced(
@@ -702,6 +974,8 @@ class CameraDisplay:
         inference_ms,
         capture_ms,
         frame_interval_ms,
+        measured_fps,
+        capture_interval_ms,
         detector,
         tx,
         runtime_error=None,
@@ -715,7 +989,7 @@ class CameraDisplay:
             color=COLOR_PANEL, fill=True,
         )
 
-        if detector.model_backend == "roi_blob":
+        if detector.model_backend in ("roi_blob", "edge_hough"):
             roi_x, roi_y, roi_width, roi_height = detector.roi
             osd.draw_rectangle(
                 self._screen_x(roi_x),
@@ -738,6 +1012,20 @@ class CameraDisplay:
             )
 
         if state.get("track_valid"):
+            tracked_diameter = max(
+                2.0,
+                float(state.get("tracked_diameter", 0.0)),
+            )
+            tracked_left = state["x"] - tracked_diameter * 0.5
+            tracked_top = state["y"] - tracked_diameter * 0.5
+            osd.draw_rectangle(
+                self._screen_x(tracked_left),
+                self._screen_y(tracked_top),
+                max(1, self._screen_x(tracked_diameter)),
+                max(1, self._screen_y(tracked_diameter)),
+                color=COLOR_FILTERED,
+                thickness=2,
+            )
             osd.draw_cross(
                 self._screen_x(state["x"]),
                 self._screen_y(state["y"]),
@@ -786,8 +1074,12 @@ class CameraDisplay:
         )
         self._draw_text(
             2,
-            "cm p={:+.2f} v={:+.2f} a={:+.1f}".format(
+            "cm[{}] x={:+.2f} ref={:+.2f} e={:+.2f} v={:+.2f} a={:+.1f}".format(
+                "MEAS" if X_CALIBRATION_MODE == X_CALIBRATION_MEASURED
+                else "PIN",
                 float(feedback.get("position_cm", 0.0)),
+                float(feedback.get("reference_position_cm", 0.0)),
+                float(feedback.get("position_error_cm", 0.0)),
                 float(feedback.get("velocity_cm_s", 0.0)),
                 float(feedback.get("acceleration_cm_s2", 0.0)),
             ),
@@ -807,21 +1099,31 @@ class CameraDisplay:
         )
         self._draw_text(
             4,
-            "T cap={} pre={} kpu={} post={} ai={} fb={} frm={}".format(
+            "T FPS={:.1f}/{} dt={:.1f} loop={} cap={} {}={} {}={} "
+            "{}={} det={} fb={} {}".format(
+                float(measured_fps),
+                int(CAMERA_FPS),
+                float(capture_interval_ms),
+                int(frame_interval_ms),
                 int(capture_ms),
+                detector.timing_labels[0],
                 int(detector.preprocess_ms),
+                detector.timing_labels[1],
                 int(detector.kpu_ms),
+                detector.timing_labels[2],
                 int(detector.postprocess_ms),
                 int(inference_ms),
                 int(feedback.get("compute_ms", 0)),
-                int(frame_interval_ms),
+                self.exposure_text(),
             ),
             COLOR_TITLE,
         )
         self._draw_text(
             5,
-            "{} reject={} acq={}/{}".format(
+            "{} f={} in={:+.1f} r={} a={}/{}".format(
                 detector.diagnostic_text(),
+                1 if state.get("fast_response") else 0,
+                float(state.get("axial_innovation", 0.0)),
                 int(state.get("association_reject_count", 0)),
                 int(state.get("acquisition_count", 0)),
                 int(state.get("acquisition_required", 3)),
@@ -927,6 +1229,7 @@ class CameraDisplay:
         self.media_initialized = False
         self.sensor = None
         self.osd = None
+        self.ruler_drawn = False
 
 
 class LatestFrameUartTx:
@@ -952,7 +1255,11 @@ class LatestFrameUartTx:
 
     def submit_latest(self, frame):
         if frame is None or len(frame) != BALL_STATE_FRAME_SIZE:
-            raise ValueError("UART state frame must be exactly 48 bytes")
+            raise ValueError(
+                "UART state frame must be exactly {} bytes".format(
+                    BALL_STATE_FRAME_SIZE
+                )
+            )
         self.submitted_frames += 1
         if self.active_frame is None:
             self.active_frame = frame
@@ -1133,8 +1440,11 @@ def _print_pc_debug_status(
     inference_ms,
     capture_ms,
     detector,
+    camera,
     tx,
     runtime_error,
+    measured_fps,
+    capture_interval_ms,
 ):
     if feedback is None:
         feedback = {}
@@ -1149,9 +1459,12 @@ def _print_pc_debug_status(
     print(
         "PCDBG seq={} mode={} flags=0x{:02X} raw=({:.1f},{:.1f}) "
         "filt=({:.2f},{:.2f}) vel=({:.1f},{:.1f}) conf={:.3f} "
-        "phys[p={:+.2f},v={:+.2f},a={:+.1f}] "
+        "obs[f={},in={:+.2f},vm={:+.1f}] "
+        "phys[p=({:+.2f},{:+.2f}),v=({:+.2f},{:+.2f}),aX={:+.1f},"
+        "ref={:+.2f},e={:+.2f}] "
         "fb[a={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
-        "model={} diag={} time[cap={},pre={},kpu={},post={},ai={}]ms "
+        "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
+        "time[cap={},{}={},{}={},{}={},det={}]ms "
         "UART[f={},b={},q={},e={},s={},z={},d={}] "
         "uart_last={} runtime_last={}".format(
             int(sequence),
@@ -1164,9 +1477,16 @@ def _print_pc_debug_status(
             float(state.get("vx", 0.0)),
             float(state.get("vy", 0.0)),
             confidence,
+            "Y" if state.get("fast_response") else "N",
+            float(state.get("axial_innovation", 0.0)),
+            float(state.get("measured_axial_velocity", 0.0)),
             float(feedback.get("position_cm", 0.0)),
+            float(feedback.get("position_y_cm", 0.0)),
             float(feedback.get("velocity_cm_s", 0.0)),
+            float(feedback.get("velocity_y_cm_s", 0.0)),
             float(feedback.get("acceleration_cm_s2", 0.0)),
+            float(feedback.get("reference_position_cm", 0.0)),
+            float(feedback.get("position_error_cm", 0.0)),
             float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
             float(feedback.get("kp", 0.0)),
             float(feedback.get("kd", 0.0)),
@@ -1175,9 +1495,17 @@ def _print_pc_debug_status(
             "Y" if feedback.get("feedback_saturated") else "N",
             detector.model_backend,
             detector.diagnostic_text(),
+            X_CALIBRATION_MODE,
+            camera.exposure_text(),
+            float(measured_fps),
+            int(CAMERA_FPS),
+            float(capture_interval_ms),
             int(capture_ms),
+            detector.timing_labels[0],
             int(detector.preprocess_ms),
+            detector.timing_labels[1],
             int(detector.kpu_ms),
+            detector.timing_labels[2],
             int(detector.postprocess_ms),
             int(inference_ms),
             tx.sent_frames,
@@ -1248,22 +1576,41 @@ def main(pc_debug=False):
         tx = LatestFrameUartTx(uart)
         stage = "tracker_init"
         tracker = PipeMotionFilter(
+            alpha=TRACK_AXIAL_FAST_ALPHA,
+            response_alpha=TRACK_AXIAL_QUIET_ALPHA,
+            response_start_px=TRACK_AXIAL_RESPONSE_START_PX,
+            response_full_px=TRACK_AXIAL_RESPONSE_FULL_PX,
+            response_beta=TRACK_VELOCITY_BETA,
+            velocity_fast_beta=TRACK_VELOCITY_FAST_BETA,
+            velocity_noise_px=TRACK_VELOCITY_NOISE_PX,
+            velocity_quiet_decay=TRACK_VELOCITY_QUIET_DECAY,
+            velocity_quiet_timeout_ms=TRACK_VELOCITY_QUIET_TIMEOUT_MS,
+            lateral_alpha=TRACK_LATERAL_ALPHA,
+            diameter_alpha=TRACK_DIAMETER_ALPHA,
+            diameter_max_step_px=TRACK_DIAMETER_MAX_STEP_PX,
             max_coast_ms=TRACK_HOLD_MAX_MS,
             max_coast_frames=TRACK_HOLD_MAX_FRAMES,
+            fixed_axis_x=(
+                PIPE_POSITIVE_END_X_PX - PIPE_NEGATIVE_END_X_PX
+            ),
+            fixed_axis_y=(
+                PIPE_POSITIVE_END_Y_PX - PIPE_NEGATIVE_END_Y_PX
+            ),
         )
         stage = "feedback_init"
         feedback_filter = BallStateFeedback(
-            negative_end_x_px=PIPE_NEGATIVE_END_X_PX,
-            negative_end_y_px=PIPE_NEGATIVE_END_Y_PX,
-            positive_end_x_px=PIPE_POSITIVE_END_X_PX,
-            positive_end_y_px=PIPE_POSITIVE_END_Y_PX,
-            pipe_length_cm=PIPE_LENGTH_CM,
             kp=FEEDBACK_KP,
             kd=FEEDBACK_KD,
             ka=FEEDBACK_KA,
             max_feedback_accel_cm_s2=FEEDBACK_ACCEL_LIMIT_CM_S2,
             max_prediction_age_ms=TRACK_HOLD_MAX_MS,
             max_prediction_frames=TRACK_HOLD_MAX_FRAMES,
+            x_calibration_mode=X_CALIBRATION_MODE,
+            reference_position_cm=FEEDBACK_REFERENCE_POSITION_CM,
+            reference_state_flags=(
+                BALL_REFERENCE_FLAG_VALID
+                | BALL_REFERENCE_FLAG_SOURCE_PRESET
+            ),
         )
         stage = "detector_init"
         detector = _create_detector()
@@ -1271,7 +1618,8 @@ def main(pc_debug=False):
             "steel-ball tracker started, version={}, backend={}, model={}, "
             "expected={}, UART={} 8N1, frame={}B, software_tx={}B, "
             "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ka={:.3f}, "
-            "px_per_cm={:.3f}, pc_debug={}".format(
+            "calibration={}, ref={:+.2f}cm, center_cm_per_px={:.5f}, exposure={}, "
+            "pc_debug={}".format(
                 APP_VERSION,
                 detector.model_backend,
                 detector.model_path,
@@ -1283,7 +1631,10 @@ def main(pc_debug=False):
                 float(feedback_filter.kp),
                 float(feedback_filter.kd),
                 float(feedback_filter.ka),
-                float(feedback_filter.pixels_per_cm),
+                feedback_filter.x_calibration_mode,
+                feedback_filter.reference_position_cm,
+                float(feedback_filter.center_cm_per_pixel),
+                camera.exposure_text(),
                 bool(pc_debug),
             )
         )
@@ -1291,6 +1642,9 @@ def main(pc_debug=False):
         last_overlay_ms = _ticks_ms() - OVERLAY_INTERVAL_MS
         last_pc_debug_ms = _ticks_ms() - PC_DEBUG_INTERVAL_MS
         last_frame_ms = _ticks_ms()
+        last_capture_finished_ms = None
+        capture_interval_ms = 0.0
+        measured_fps = 0.0
         frame_count = 0
         consecutive_errors = 0
         runtime_error_count = 0
@@ -1314,22 +1668,52 @@ def main(pc_debug=False):
                 capture_start_ms = _ticks_ms()
                 detector_input = camera.get_frame()
                 capture_finished_ms = _ticks_ms()
+                if last_capture_finished_ms is not None:
+                    capture_sample_ms = max(
+                        1,
+                        _ticks_diff(
+                            capture_finished_ms,
+                            last_capture_finished_ms,
+                        ),
+                    )
+                    if capture_interval_ms <= 0.0:
+                        capture_interval_ms = float(capture_sample_ms)
+                    else:
+                        capture_interval_ms += 0.12 * (
+                            float(capture_sample_ms) - capture_interval_ms
+                        )
+                    measured_fps = 1000.0 / capture_interval_ms
+                last_capture_finished_ms = capture_finished_ms
                 capture_ms = max(
                     0,
                     _ticks_diff(capture_finished_ms, capture_start_ms),
                 )
-                stage = "model_inference"
+                stage = "detector_run"
                 inference_start_ms = capture_finished_ms
-                detections = detector.run(detector_input)
+                if detector.model_backend in ("roi_blob", "edge_hough"):
+                    detections = detector.run(
+                        detector_input,
+                        tracker.detection_hint(capture_finished_ms),
+                    )
+                else:
+                    detections = detector.run(detector_input)
                 finished_ms = _ticks_ms()
                 inference_ms = max(
                     0,
                     _ticks_diff(finished_ms, inference_start_ms),
                 )
+                # The frame represents the capture-finished instant. Associate
+                # and correct at that measurement time, then predict only
+                # through the measured detector latency to the publish instant.
+                measurement_ms = capture_finished_ms
                 stage = "target_association"
-                candidate = tracker.select_candidate(detections, finished_ms)
+                candidate = tracker.select_candidate(detections, measurement_ms)
                 stage = "motion_filter"
-                state = tracker.update(candidate, finished_ms)
+                state = tracker.update(
+                    candidate,
+                    measurement_ms,
+                    output_ms=finished_ms,
+                )
                 stage = "visual_feedback"
                 feedback_start_ms = _ticks_ms()
                 feedback = feedback_filter.update(
@@ -1410,6 +1794,8 @@ def main(pc_debug=False):
                     inference_ms,
                     capture_ms,
                     frame_interval_ms,
+                    measured_fps,
+                    capture_interval_ms,
                     detector,
                     tx,
                     runtime_error=latched_runtime_error,
@@ -1429,8 +1815,11 @@ def main(pc_debug=False):
                     inference_ms,
                     capture_ms,
                     detector,
+                    camera,
                     tx,
                     latched_runtime_error,
+                    measured_fps,
+                    capture_interval_ms,
                 )
                 last_pc_debug_ms = now_ms
             frame_count = (frame_count + 1) & 0xFFFFFFFF

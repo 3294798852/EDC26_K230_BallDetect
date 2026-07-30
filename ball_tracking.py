@@ -194,23 +194,22 @@ def select_highest_confidence_ball(
 
 
 class PipeMotionFilter:
-    """Constant-velocity filter with a learned straight-pipe constraint.
+    """Asymmetric low-lag observer for one-dimensional pipe motion.
 
-    Before enough motion is observed, the state is an ordinary 2-D alpha-beta
-    filter.  Once the displacement is large enough, an image-space pipe axis
-    is locked.  Velocity is then projected onto that axis and lateral position
-    corrections are deliberately weak.  The axial gains ease down for a small
-    innovation and return to the fast gains for acceleration or reversal.
-    Bounded candidate association preserves target identity, and an out-of-gate
-    challenger must remain spatially consistent before it may replace a track.
+    A configured pipe axis is used immediately when available. Axial position
+    has a small noise band and a fast measurement response outside it. Axial
+    velocity follows consecutive accepted measurements, including reversals,
+    while lateral position is strongly smoothed and lateral velocity is zero.
+    Apparent diameter changes slowly with a per-frame bound. The former learned
+    axis remains as a compatibility fallback when no fixed axis is supplied.
     """
 
     def __init__(
         self,
-        alpha=0.82,
-        beta=0.28,
-        lateral_alpha=0.12,
-        lateral_beta=0.02,
+        alpha=0.96,
+        beta=0.55,
+        lateral_alpha=0.08,
+        lateral_beta=0.0,
         base_gate_px=32.0,
         max_gate_px=96.0,
         lateral_gate_px=14.0,
@@ -222,20 +221,34 @@ class PipeMotionFilter:
         frame_width=320,
         frame_height=320,
         max_speed_px_s=2500.0,
-        response_alpha=0.72,
-        response_beta=0.18,
-        response_start_px=0.8,
-        response_full_px=4.0,
-        response_speed_px_s=120.0,
+        response_alpha=0.18,
+        response_beta=0.30,
+        response_start_px=0.25,
+        response_full_px=1.50,
+        response_speed_px_s=60.0,
         acquire_confirm_frames=3,
         acquire_timeout_ms=180,
         acquire_radius_px=36.0,
         acquire_min_confidence=0.50,
+        fixed_axis_x=None,
+        fixed_axis_y=None,
+        velocity_fast_beta=0.85,
+        velocity_quiet_decay=0.35,
+        velocity_noise_px=0.90,
+        velocity_quiet_timeout_ms=120,
+        diameter_alpha=0.08,
+        diameter_max_step_px=1.0,
     ):
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.response_alpha = min(float(response_alpha), self.alpha)
-        self.response_beta = min(float(response_beta), self.beta)
+        self.alpha = _clamp(float(alpha), 0.0, 1.0)
+        self.beta = _clamp(float(beta), 0.0, 1.0)
+        self.response_alpha = min(
+            _clamp(float(response_alpha), 0.0, 1.0),
+            self.alpha,
+        )
+        self.response_beta = min(
+            _clamp(float(response_beta), 0.0, 1.0),
+            self.beta,
+        )
         self.response_start_px = max(0.0, float(response_start_px))
         self.response_full_px = max(
             self.response_start_px + 0.001,
@@ -244,9 +257,36 @@ class PipeMotionFilter:
         self.response_speed_px_s = max(1.0, float(response_speed_px_s))
         self.response_start_squared = self.response_start_px * self.response_start_px
         self.response_full_squared = self.response_full_px * self.response_full_px
-        self.response_speed_squared = (
-            self.response_speed_px_s * self.response_speed_px_s
+        self.velocity_fast_beta = _clamp(
+            float(velocity_fast_beta),
+            self.beta,
+            1.0,
         )
+        self.velocity_quiet_decay = _clamp(
+            float(velocity_quiet_decay),
+            0.0,
+            1.0,
+        )
+        self.velocity_noise_px = max(0.0, float(velocity_noise_px))
+        self.velocity_quiet_timeout_ms = max(
+            1,
+            int(velocity_quiet_timeout_ms),
+        )
+        self.diameter_alpha = _clamp(float(diameter_alpha), 0.0, 1.0)
+        self.diameter_max_step_px = max(
+            0.0,
+            float(diameter_max_step_px),
+        )
+        axis_x = 0.0 if fixed_axis_x is None else float(fixed_axis_x)
+        axis_y = 0.0 if fixed_axis_y is None else float(fixed_axis_y)
+        axis_magnitude = math.sqrt(axis_x * axis_x + axis_y * axis_y)
+        self.fixed_axis = axis_magnitude > 0.0001
+        if self.fixed_axis:
+            self.config_axis_x = axis_x / axis_magnitude
+            self.config_axis_y = axis_y / axis_magnitude
+        else:
+            self.config_axis_x = 1.0
+            self.config_axis_y = 0.0
         self.acquire_confirm_frames = max(1, int(acquire_confirm_frames))
         self.acquire_timeout_ms = max(1, int(acquire_timeout_ms))
         self.acquire_radius_px = max(1.0, float(acquire_radius_px))
@@ -274,20 +314,27 @@ class PipeMotionFilter:
         self.max_speed_px_s = max(1.0, float(max_speed_px_s))
         self.clear()
 
+    def _restore_axis(self):
+        self.axis_locked = bool(self.fixed_axis)
+        self.axis_x = self.config_axis_x
+        self.axis_y = self.config_axis_y
+
     def clear(self):
         self.initialized = False
         self.track_valid = False
-        self.axis_locked = False
+        self._restore_axis()
         self.x = 0.0
         self.y = 0.0
         self.vx = 0.0
         self.vy = 0.0
-        self.axis_x = 1.0
-        self.axis_y = 0.0
         self.axis_seed_x = 0.0
         self.axis_seed_y = 0.0
         self.last_measure_x = 0.0
         self.last_measure_y = 0.0
+        self.velocity_anchor_x = 0.0
+        self.velocity_anchor_y = 0.0
+        self.velocity_anchor_ms = None
+        self.tracked_diameter = 0.0
         self.last_update_ms = None
         self.last_measurement_ms = None
         self.missed_frames = 0
@@ -299,24 +346,37 @@ class PipeMotionFilter:
         self.last_detection_count = 0
         self.last_association_rejected = False
         self.association_reject_count = 0
+        self.last_axial_innovation = 0.0
+        self.last_measured_velocity = 0.0
+        self.fast_response_active = False
+        self.velocity_braking = False
 
     def _reset_from_measurement(self, candidate, now_ms):
         self.initialized = True
         self.track_valid = True
-        self.axis_locked = False
+        self._restore_axis()
         self.x = float(candidate["center_x"])
         self.y = float(candidate["center_y"])
         self.vx = 0.0
         self.vy = 0.0
-        self.axis_x = 1.0
-        self.axis_y = 0.0
         self.axis_seed_x = self.x
         self.axis_seed_y = self.y
         self.last_measure_x = self.x
         self.last_measure_y = self.y
+        self.velocity_anchor_x = self.x
+        self.velocity_anchor_y = self.y
+        self.velocity_anchor_ms = int(now_ms)
+        self.tracked_diameter = max(
+            0.0,
+            float(candidate.get("diameter", 0.0)),
+        )
         self.last_update_ms = int(now_ms)
         self.last_measurement_ms = int(now_ms)
         self.missed_frames = 0
+        self.last_axial_innovation = 0.0
+        self.last_measured_velocity = 0.0
+        self.fast_response_active = False
+        self.velocity_braking = False
         self._clear_pending_acquisition()
         self.reacquire_requested = False
 
@@ -393,6 +453,40 @@ class PipeMotionFilter:
             _elapsed_ms(now_ms, self.last_measurement_ms),
         )
 
+    def detection_hint(self, now_ms):
+        """Return a read-only prediction for a tracking-aware detector.
+
+        The hint never changes filter state and expires with the normal HOLD
+        interval. Detectors may narrow their search with it, while the normal
+        association gate remains authoritative.
+        """
+        now_ms = int(now_ms)
+        if not self.initialized or self._is_expired(now_ms):
+            return None
+        predicted_x, predicted_y, dt = self._predicted_position(now_ms)
+        speed = math.sqrt(self.vx * self.vx + self.vy * self.vy)
+        search_radius = _clamp(
+            self.base_gate_px + speed * dt * 1.5,
+            self.base_gate_px,
+            self.max_gate_px,
+        )
+        return {
+            "center_x": _clamp(
+                predicted_x,
+                0.0,
+                float(self.frame_width - 1),
+            ),
+            "center_y": _clamp(
+                predicted_y,
+                0.0,
+                float(self.frame_height - 1),
+            ),
+            "speed_px_s": speed,
+            "diameter": self.tracked_diameter,
+            "search_radius_px": search_radius,
+            "measurement_age_ms": self._measurement_age(now_ms),
+        }
+
     def _bound_state(self):
         self.x = _clamp(self.x, 0.0, float(self.frame_width - 1))
         self.y = _clamp(self.y, 0.0, float(self.frame_height - 1))
@@ -418,6 +512,8 @@ class PipeMotionFilter:
         return dt
 
     def _learn_axis(self, candidate):
+        if self.fixed_axis:
+            return
         measurement_x = float(candidate["center_x"])
         measurement_y = float(candidate["center_y"])
         if not self.axis_locked:
@@ -629,41 +725,46 @@ class PipeMotionFilter:
                 return False
         return True
 
-    def _correct(self, candidate, dt):
-        residual_x = float(candidate["center_x"]) - self.x
-        residual_y = float(candidate["center_y"]) - self.y
+    def _correct(self, candidate, dt, now_ms):
+        measurement_x = float(candidate["center_x"])
+        measurement_y = float(candidate["center_y"])
+        residual_x = measurement_x - self.x
+        residual_y = measurement_y - self.y
         residual_squared = residual_x * residual_x + residual_y * residual_y
-        response = _clamp(
-            (residual_squared - self.response_start_squared)
-            / (self.response_full_squared - self.response_start_squared),
-            0.0,
-            1.0,
-        )
-        speed_squared = self.vx * self.vx + self.vy * self.vy
-        speed_response = _clamp(
-            speed_squared / self.response_speed_squared,
-            0.0,
-            1.0,
-        )
-        response = max(response, speed_response)
-        alpha = self.response_alpha + (
-            self.alpha - self.response_alpha
-        ) * response
-        beta = self.response_beta + (
-            self.beta - self.response_beta
-        ) * response
-        if not self.axis_locked:
-            self.x += alpha * residual_x
-            self.y += alpha * residual_y
-            self.vx += beta * residual_x / dt
-            self.vy += beta * residual_y / dt
-            self._bound_state()
-            return
-
         normal_x = -self.axis_y
         normal_y = self.axis_x
         along = residual_x * self.axis_x + residual_y * self.axis_y
         lateral = residual_x * normal_x + residual_y * normal_y
+        response_squared = (
+            along * along if self.axis_locked else residual_squared
+        )
+        response = _clamp(
+            (response_squared - self.response_start_squared)
+            / (self.response_full_squared - self.response_start_squared),
+            0.0,
+            1.0,
+        )
+        alpha = self.response_alpha + (
+            self.alpha - self.response_alpha
+        ) * response
+        if not self.axis_locked:
+            beta = self.response_beta + (
+                self.beta - self.response_beta
+            ) * response
+            self.x += alpha * residual_x
+            self.y += alpha * residual_y
+            self.vx += beta * residual_x / dt
+            self.vy += beta * residual_y / dt
+            self.last_axial_innovation = math.sqrt(residual_squared)
+            self.last_measured_velocity = math.sqrt(
+                self.vx * self.vx + self.vy * self.vy
+            )
+            self.fast_response_active = response >= 0.5
+            self._bound_state()
+            return
+
+        self.last_axial_innovation = along
+        self.fast_response_active = response >= 0.5
         self.x += (
             alpha * along * self.axis_x
             + self.lateral_alpha * lateral * normal_x
@@ -672,22 +773,82 @@ class PipeMotionFilter:
             alpha * along * self.axis_y
             + self.lateral_alpha * lateral * normal_y
         )
-        along_velocity = self.vx * self.axis_x + self.vy * self.axis_y
-        along_velocity += beta * along / dt
-        lateral_velocity = self.lateral_beta * lateral / dt
-        self.vx = (
-            along_velocity * self.axis_x
-            + lateral_velocity * normal_x
+
+        measured_dx = measurement_x - self.velocity_anchor_x
+        measured_dy = measurement_y - self.velocity_anchor_y
+        measured_along = (
+            measured_dx * self.axis_x + measured_dy * self.axis_y
         )
-        self.vy = (
-            along_velocity * self.axis_y
-            + lateral_velocity * normal_y
-        )
-        # The pipe is one-dimensional: retain only axial velocity.
         along_velocity = self.vx * self.axis_x + self.vy * self.axis_y
+        velocity_anchor_age_ms = 0
+        if self.velocity_anchor_ms is not None:
+            velocity_anchor_age_ms = _elapsed_ms(
+                now_ms,
+                self.velocity_anchor_ms,
+            )
+        if abs(measured_along) <= self.velocity_noise_px:
+            self.last_measured_velocity = 0.0
+            braking_innovation = (
+                along_velocity * along < 0.0
+                and abs(along) >= self.velocity_noise_px
+            )
+            if braking_innovation:
+                self.velocity_braking = True
+            quiet_confirmed = (
+                velocity_anchor_age_ms >= self.velocity_quiet_timeout_ms
+            )
+            if self.velocity_braking or quiet_confirmed:
+                along_velocity *= self.velocity_quiet_decay
+                if abs(along_velocity) < 1.0:
+                    along_velocity = 0.0
+                    self.velocity_braking = False
+                self.velocity_anchor_x = measurement_x
+                self.velocity_anchor_y = measurement_y
+                self.velocity_anchor_ms = int(now_ms)
+        else:
+            self.velocity_braking = False
+            velocity_dt = 0.010
+            if self.velocity_anchor_ms is not None:
+                velocity_dt = _clamp(
+                    velocity_anchor_age_ms / 1000.0,
+                    0.010,
+                    0.200,
+                )
+            measured_velocity = measured_along / velocity_dt
+            self.last_measured_velocity = measured_velocity
+            direction_changed = (
+                along_velocity * measured_velocity < 0.0
+                and abs(measured_velocity) > self.response_speed_px_s
+            )
+            velocity_beta = self.response_beta + (
+                self.velocity_fast_beta - self.response_beta
+            ) * response
+            if direction_changed:
+                velocity_beta = self.velocity_fast_beta
+            along_velocity += velocity_beta * (
+                measured_velocity - along_velocity
+            )
+            self.velocity_anchor_x = measurement_x
+            self.velocity_anchor_y = measurement_y
+            self.velocity_anchor_ms = int(now_ms)
         self.vx = along_velocity * self.axis_x
         self.vy = along_velocity * self.axis_y
         self._bound_state()
+
+    def _update_diameter(self, measured_diameter):
+        measured_diameter = max(0.0, float(measured_diameter))
+        if measured_diameter <= 0.0:
+            return
+        if self.tracked_diameter <= 0.0:
+            self.tracked_diameter = measured_diameter
+            return
+        difference = measured_diameter - self.tracked_diameter
+        difference = _clamp(
+            difference,
+            -self.diameter_max_step_px,
+            self.diameter_max_step_px,
+        )
+        self.tracked_diameter += self.diameter_alpha * difference
 
     def _snapshot(
         self,
@@ -727,16 +888,33 @@ class PipeMotionFilter:
             "vy": self.vy,
             "axis_x": self.axis_x,
             "axis_y": self.axis_y,
+            "tracked_diameter": self.tracked_diameter,
+            "axial_innovation": self.last_axial_innovation,
+            "measured_axial_velocity": self.last_measured_velocity,
+            "fast_response": bool(self.fast_response_active),
+            "velocity_braking": bool(self.velocity_braking),
         }
 
-    def update(self, candidate, now_ms):
-        """Update from one associated candidate or from a miss."""
+    def _advance_to_output(self, output_ms):
+        if output_ms is None:
+            return self.last_update_ms
+        output_ms = int(output_ms)
+        if (
+            self.last_update_ms is not None
+            and _elapsed_ms(output_ms, self.last_update_ms) > 0
+        ):
+            self._predict(output_ms)
+        return output_ms
+
+    def update(self, candidate, now_ms, output_ms=None):
+        """Update at measurement time, then predict to the bounded output time."""
         now_ms = int(now_ms)
         expired = self._is_expired(now_ms)
         if self.reacquire_requested and candidate is not None:
             self._reset_from_measurement(candidate, now_ms)
+            state_time_ms = self._advance_to_output(output_ms)
             return self._snapshot(
-                now_ms,
+                now_ms if state_time_ms is None else state_time_ms,
                 measurement_accepted=True,
                 filter_reset=True,
             )
@@ -747,15 +925,18 @@ class PipeMotionFilter:
                 now_ms,
             ):
                 self._reset_from_measurement(candidate, now_ms)
+                state_time_ms = self._advance_to_output(output_ms)
                 return self._snapshot(
-                    now_ms,
+                    now_ms if state_time_ms is None else state_time_ms,
                     measurement_accepted=True,
                     filter_reset=True,
                 )
             if candidate is None:
                 self._clear_pending_acquisition()
             if not self.initialized:
-                return self._snapshot(now_ms)
+                return self._snapshot(
+                    now_ms if output_ms is None else int(output_ms)
+                )
             # An expired track may coast for diagnostics, but no candidate is
             # allowed to update it until the new-target confirmation succeeds.
             candidate = None
@@ -766,9 +947,10 @@ class PipeMotionFilter:
         if candidate is not None:
             if self._accept_measurement(candidate, dt):
                 self._learn_axis(candidate)
-                self._correct(candidate, dt)
+                self._correct(candidate, dt, now_ms)
                 self.last_measure_x = float(candidate["center_x"])
                 self.last_measure_y = float(candidate["center_y"])
+                self._update_diameter(candidate.get("diameter", 0.0))
                 self.last_measurement_ms = now_ms
                 self.missed_frames = 0
                 accepted = True
@@ -785,8 +967,9 @@ class PipeMotionFilter:
         ):
             self.vx = 0.0
             self.vy = 0.0
+        state_time_ms = self._advance_to_output(output_ms)
         return self._snapshot(
-            now_ms,
+            now_ms if state_time_ms is None else state_time_ms,
             measurement_accepted=accepted,
             outlier_rejected=outlier_rejected,
         )

@@ -77,19 +77,32 @@ All multibyte fields are little-endian. CRC16-CCITT-FALSE uses polynomial
 | 40..41 | 54..55 | 2 | `u16` | reference state/source flags |
 | 42..47 | 56..61 | 6 | bytes | reserved extension; schema 6 requires all zero |
 
-The feedback definition is
+The raw feedback target is
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.05) + Kd*Db(v, 1.0) + Ka*a)
+a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
+
+Default gains are `Kp=8.0`, `Kd=7.5`, `Ka=0`, and `a_fb` is limited to
+`+/-140 cm/s2`. Tracker-internal `PENDING` and `MOVING` states both retain the
+velocity used by `Kd`; only `QUIET` sets the control velocity to zero. Motion
+starts after at least two reliable same-direction measurements; uncertain Hough
+measurements require three, and no single quiet-state jump creates velocity.
+Motion must then show four consecutive axial center steps no larger than
+`0.75 px` before returning to `QUIET`. Confirmed `MOVING` uses the raw target immediately. Sustained
+non-moving output follows it with gain `0.35` and zero hysteresis, allowing the
+feedback to converge fully to zero. This internal motion state and the raw
+pre-stabilization target are screen/PC diagnostics and are not additional
+schema-6 fields.
 
 `x_ref` is the currently applied K230 reference, expressed as an absolute
 calibrated X coordinate in centimeters. Offsets 8/16 continue to carry absolute
 ball position. The LCD and PC debug output also show `x`, `ref` and `e`. The MCU
-can cross-check the transmitted feedback inputs but must not apply the same
-`Kp/Kd` feedback a second time. A
+can cross-check position/reference consistency and feedback bounds, but cannot
+reconstruct every quiet-state `a_fb` sample from the UART fields alone. It must
+not apply the same `Kp/Kd` feedback a second time. A
 future MCU command that changes the reference must define validation, sequence,
 acknowledgement, applied-value reporting and a bounded slew/ramp before it is
 safety-usable. A reference step creates an immediate `Kp*Delta x_ref` change in
@@ -105,8 +118,9 @@ controller.
 Offsets 16 and 18 intentionally repeat the physical X and X-velocity used by
 the control law, preserving the established one-dimensional control offsets
 from schema 4.
-The deadbands above affect only `a_fb`; transmitted physical state remains
-the filtered physical state before deadband. `Ka` defaults to zero, while `a`
+The deadbands and quiet-state stabilization affect only `a_fb`; transmitted
+physical state remains the filtered physical state before these operations.
+`Ka` defaults to zero, while `a`
 remains available for diagnostics. `a_fb` is an equivalent ball-acceleration
 feedback component, not a desired pipe angle or actuator/PWM command.
 
@@ -186,7 +200,8 @@ carried a desired angle at payload 28..29; neither may be decoded as schema 6.
 ## Verification boundary
 
 K230 host tests cover fixed length, scales, signed values, CRC, split/coalesced
-frames, noise recovery and feedback bounds. The MCU decoder has not been
-modified in this task and must be updated separately for schema 6. End-to-end
+frames, noise recovery, motion hysteresis and feedback stabilization/bounds.
+The MCU decoder has not been modified in this task and must be updated
+separately for schema 6. End-to-end
 UART, sign convention, physical calibration, controller composition and
 actuator safety still require hardware verification.

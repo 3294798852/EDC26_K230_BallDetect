@@ -238,6 +238,19 @@ class PipeMotionFilter:
         velocity_quiet_timeout_ms=120,
         diameter_alpha=0.08,
         diameter_max_step_px=1.0,
+        motion_start_px=2.5,
+        motion_immediate_px=14.0,
+        motion_confirm_frames=2,
+        motion_stop_frames=4,
+        motion_direction_epsilon_px=0.75,
+        ambiguous_position_alpha=0.10,
+        quiet_position_alpha=0.12,
+        quiet_velocity_decay=0.20,
+        quiet_gate_diameter_factor=1.25,
+        quiet_gate_min_px=10.0,
+        motion_min_quality=0.62,
+        motion_min_support=2,
+        association_ambiguity_diameter_factor=0.75,
     ):
         self.alpha = _clamp(float(alpha), 0.0, 1.0)
         self.beta = _clamp(float(beta), 0.0, 1.0)
@@ -276,6 +289,47 @@ class PipeMotionFilter:
         self.diameter_max_step_px = max(
             0.0,
             float(diameter_max_step_px),
+        )
+        self.motion_start_px = max(0.1, float(motion_start_px))
+        self.motion_immediate_px = max(
+            self.motion_start_px,
+            float(motion_immediate_px),
+        )
+        self.motion_confirm_frames = max(1, int(motion_confirm_frames))
+        self.motion_stop_frames = max(1, int(motion_stop_frames))
+        self.motion_direction_epsilon_px = max(
+            0.0,
+            float(motion_direction_epsilon_px),
+        )
+        self.ambiguous_position_alpha = _clamp(
+            float(ambiguous_position_alpha),
+            0.0,
+            self.alpha,
+        )
+        self.quiet_position_alpha = _clamp(
+            float(quiet_position_alpha),
+            0.0,
+            self.alpha,
+        )
+        self.quiet_velocity_decay = _clamp(
+            float(quiet_velocity_decay),
+            0.0,
+            1.0,
+        )
+        self.quiet_gate_diameter_factor = max(
+            0.50,
+            float(quiet_gate_diameter_factor),
+        )
+        self.quiet_gate_min_px = max(2.0, float(quiet_gate_min_px))
+        self.motion_min_quality = _clamp(
+            float(motion_min_quality),
+            0.0,
+            1.0,
+        )
+        self.motion_min_support = max(1, int(motion_min_support))
+        self.association_ambiguity_diameter_factor = max(
+            0.10,
+            float(association_ambiguity_diameter_factor),
         )
         axis_x = 0.0 if fixed_axis_x is None else float(fixed_axis_x)
         axis_y = 0.0 if fixed_axis_y is None else float(fixed_axis_y)
@@ -350,6 +404,17 @@ class PipeMotionFilter:
         self.last_measured_velocity = 0.0
         self.fast_response_active = False
         self.velocity_braking = False
+        self.motion_state = "QUIET"
+        self.motion_confirm_count = 0
+        self.motion_pending_sign = 0
+        self.motion_direction = 0
+        self.motion_quiet_count = 0
+        self.last_motion_step = 0.0
+        self.measurement_ambiguous = False
+        self.measurement_quality = 1.0
+        self.measurement_support = 0
+        self.association_wide = False
+        self.association_competing = False
 
     def _reset_from_measurement(self, candidate, now_ms):
         self.initialized = True
@@ -377,6 +442,19 @@ class PipeMotionFilter:
         self.last_measured_velocity = 0.0
         self.fast_response_active = False
         self.velocity_braking = False
+        self.motion_state = "QUIET"
+        self.motion_confirm_count = 0
+        self.motion_pending_sign = 0
+        self.motion_direction = 0
+        self.motion_quiet_count = 0
+        self.last_motion_step = 0.0
+        self.measurement_ambiguous = False
+        self.measurement_quality = float(
+            candidate.get("measurement_quality", 1.0)
+        )
+        self.measurement_support = int(candidate.get("support_count", 0))
+        self.association_wide = False
+        self.association_competing = False
         self._clear_pending_acquisition()
         self.reacquire_requested = False
 
@@ -412,6 +490,13 @@ class PipeMotionFilter:
                 best = candidate
         return best
 
+    @staticmethod
+    def _acquisition_score(candidate):
+        return float(candidate.get(
+            "acquisition_score",
+            candidate.get("confidence", 0.0),
+        ))
+
     def _highest_acquisition_candidate(self, candidates):
         best = None
         for candidate in candidates:
@@ -424,8 +509,8 @@ class PipeMotionFilter:
                 continue
             if (
                 best is None
-                or float(candidate.get("confidence", 0.0))
-                > float(best.get("confidence", 0.0))
+                or self._acquisition_score(candidate)
+                > self._acquisition_score(best)
             ):
                 best = candidate
         return best
@@ -564,7 +649,94 @@ class PipeMotionFilter:
                 + speed * dt * 0.90,
             )
             total_gate = min(total_gate, edge_gate)
+        if (
+            self.axis_locked
+            and self.motion_state == "PENDING"
+            and self.motion_pending_sign != 0
+        ):
+            measurement_dx = (
+                float(candidate.get("center_x", 0.0))
+                - self.last_measure_x
+            )
+            measurement_dy = (
+                float(candidate.get("center_y", 0.0))
+                - self.last_measure_y
+            )
+            measurement_step = (
+                measurement_dx * self.axis_x
+                + measurement_dy * self.axis_y
+            )
+            step_direction = 0
+            if abs(measurement_step) >= self.motion_immediate_px:
+                step_direction = 1 if measurement_step > 0.0 else -1
+            if step_direction == self.motion_pending_sign:
+                total_gate = max(
+                    total_gate,
+                    min(
+                        self.max_gate_px,
+                        self.base_gate_px
+                        + max(
+                            self.motion_immediate_px,
+                            abs(measurement_step),
+                        ),
+                    ),
+                )
         return total_gate
+
+    def _quiet_association_gate(self, candidate):
+        diameter = max(
+            1.0,
+            self.tracked_diameter,
+            float(candidate.get("diameter", 0.0)),
+        )
+        return min(
+            self.base_gate_px,
+            max(
+                self.quiet_gate_min_px,
+                diameter * self.quiet_gate_diameter_factor,
+            ),
+        )
+
+    def _candidate_tracking_ambiguous(self, candidate):
+        if (
+            candidate.get("measurement_ambiguous")
+            or candidate.get("association_competing")
+        ):
+            return True
+        if (
+            float(candidate.get("measurement_quality", 1.0))
+            < self.motion_min_quality
+        ):
+            return True
+        if (
+            "support_count" in candidate
+            and int(candidate.get("support_count", 0))
+            < self.motion_min_support
+        ):
+            return True
+        return False
+
+    def _pending_direction_priority(self, candidate):
+        if (
+            not self.axis_locked
+            or self.motion_state != "PENDING"
+            or self.motion_pending_sign == 0
+        ):
+            return 0
+        measurement_dx = (
+            float(candidate.get("center_x", 0.0)) - self.last_measure_x
+        )
+        measurement_dy = (
+            float(candidate.get("center_y", 0.0)) - self.last_measure_y
+        )
+        measurement_step = (
+            measurement_dx * self.axis_x
+            + measurement_dy * self.axis_y
+        )
+        if abs(measurement_step) <= self.motion_direction_epsilon_px:
+            return 1
+        direction = 1 if measurement_step > 0.0 else -1
+        return 0 if direction == self.motion_pending_sign else 1
 
     def select_candidate(self, candidates, now_ms):
         """Select one detection while preserving the currently tracked target.
@@ -600,26 +772,74 @@ class PipeMotionFilter:
         speed = math.sqrt(self.vx * self.vx + self.vy * self.vy)
         best = None
         best_distance = 0.0
+        best_priority = 0
+        best_wide = False
+        second = None
+        second_distance = 0.0
+        second_priority = 0
         challenger = None
         challenger_distance = 0.0
         for candidate in candidates:
             if candidate is None:
                 continue
+            candidate["association_wide"] = False
+            candidate["association_competing"] = False
+            candidate["tracking_ambiguous"] = False
             dx = float(candidate.get("center_x", 0.0)) - predicted_x
             dy = float(candidate.get("center_y", 0.0)) - predicted_y
             distance = math.sqrt(dx * dx + dy * dy)
             if distance <= self._measurement_gate(candidate, dt, speed):
-                if (
+                candidate_ambiguous = (
+                    self._candidate_tracking_ambiguous(candidate)
+                )
+                quiet_wide = bool(
+                    self.motion_state != "MOVING"
+                    and distance > self._quiet_association_gate(candidate)
+                )
+                priority = 2 if candidate_ambiguous else 0
+                if quiet_wide:
+                    priority += 1
+                    if self.motion_state == "PENDING":
+                        priority += self._pending_direction_priority(
+                            candidate
+                        )
+                better = bool(
                     best is None
-                    or distance < best_distance
+                    or priority < best_priority
                     or (
-                        abs(distance - best_distance) <= 0.5
-                        and float(candidate.get("confidence", 0.0))
-                        > float(best.get("confidence", 0.0))
+                        priority == best_priority
+                        and (
+                            distance < best_distance
+                            or (
+                                abs(distance - best_distance) <= 0.5
+                                and float(candidate.get("confidence", 0.0))
+                                > float(best.get("confidence", 0.0))
+                            )
+                        )
                     )
-                ):
+                )
+                if better:
+                    second = best
+                    second_distance = best_distance
+                    second_priority = best_priority
                     best = candidate
                     best_distance = distance
+                    best_priority = priority
+                    best_wide = bool(
+                        self.motion_state != "MOVING"
+                        and distance > self._quiet_association_gate(candidate)
+                    )
+                elif (
+                    second is None
+                    or priority < second_priority
+                    or (
+                        priority == second_priority
+                        and distance < second_distance
+                    )
+                ):
+                    second = candidate
+                    second_distance = distance
+                    second_priority = priority
                 continue
             pending_distance = distance
             if self.pending_count > 0:
@@ -650,6 +870,23 @@ class PipeMotionFilter:
                 challenger_distance = pending_distance
 
         if best is not None:
+            diameter = max(
+                1.0,
+                self.tracked_diameter,
+                float(best.get("diameter", 0.0)),
+            )
+            competing = bool(
+                second is not None
+                and second_priority == best_priority
+                and second_distance
+                <= best_distance
+                + diameter * self.association_ambiguity_diameter_factor
+            )
+            best["association_wide"] = best_wide
+            best["association_competing"] = competing
+            best["tracking_ambiguous"] = (
+                self._candidate_tracking_ambiguous(best)
+            )
             self._clear_pending_acquisition()
             return best
         if challenger is not None and self._confirm_new_target(
@@ -725,6 +962,130 @@ class PipeMotionFilter:
                 return False
         return True
 
+    def _motion_response(self, along, candidate):
+        self.measurement_ambiguous = bool(
+            candidate.get("measurement_ambiguous")
+            or candidate.get("tracking_ambiguous")
+            or self._candidate_tracking_ambiguous(candidate)
+        )
+        self.measurement_quality = _clamp(
+            float(candidate.get("measurement_quality", 1.0)),
+            0.0,
+            1.0,
+        )
+        self.measurement_support = int(candidate.get("support_count", 0))
+        self.association_wide = bool(candidate.get("association_wide"))
+        self.association_competing = bool(
+            candidate.get("association_competing")
+        )
+        measurement_dx = (
+            float(candidate["center_x"]) - self.last_measure_x
+        )
+        measurement_dy = (
+            float(candidate["center_y"]) - self.last_measure_y
+        )
+        measurement_step = (
+            measurement_dx * self.axis_x + measurement_dy * self.axis_y
+        )
+        self.last_motion_step = measurement_step
+        magnitude = abs(along)
+        step_magnitude = abs(measurement_step)
+        required_frames = self.motion_confirm_frames
+        start_threshold = self.motion_start_px
+        if self.measurement_ambiguous:
+            required_frames += 1
+            start_threshold *= 1.5
+        direction = 0
+        if step_magnitude > self.motion_direction_epsilon_px:
+            direction = 1 if measurement_step > 0.0 else -1
+        immediate_confirmed = False
+        if step_magnitude >= self.motion_immediate_px and direction != 0:
+            if self.motion_state == "MOVING":
+                immediate_confirmed = bool(
+                    not self.measurement_ambiguous
+                    or (
+                        self.motion_pending_sign == direction
+                        and self.motion_confirm_count > 0
+                    )
+                )
+            else:
+                immediate_confirmed = bool(
+                    not self.measurement_ambiguous
+                    and self.motion_pending_sign == direction
+                    and self.motion_confirm_count > 0
+                )
+
+        if self.motion_state == "MOVING":
+            if direction == self.motion_direction and direction != 0:
+                self.motion_quiet_count = 0
+                self.motion_confirm_count = required_frames
+                self.motion_pending_sign = direction
+                return True
+            if direction == 0:
+                self.motion_quiet_count = min(
+                    self.motion_stop_frames,
+                    self.motion_quiet_count + 1,
+                )
+                if self.motion_quiet_count < self.motion_stop_frames:
+                    return True
+                self.motion_state = "QUIET"
+                self.motion_confirm_count = 0
+                self.motion_pending_sign = 0
+                self.motion_direction = 0
+                return False
+
+            self.motion_quiet_count = 0
+            if self.motion_pending_sign == direction:
+                self.motion_confirm_count = min(
+                    required_frames,
+                    self.motion_confirm_count + 1,
+                )
+            else:
+                self.motion_pending_sign = direction
+                self.motion_confirm_count = 1
+            if (
+                immediate_confirmed
+                or self.motion_confirm_count >= required_frames
+            ):
+                self.motion_state = "MOVING"
+                self.motion_direction = direction
+                self.motion_confirm_count = required_frames
+                return True
+            self.motion_state = "PENDING"
+            return False
+
+        if direction == 0:
+            self.motion_state = "QUIET"
+            self.motion_confirm_count = 0
+            self.motion_pending_sign = 0
+            self.motion_direction = 0
+            self.motion_quiet_count = 0
+            return False
+
+        if (
+            self.motion_pending_sign == direction
+        ):
+            self.motion_confirm_count = min(
+                required_frames,
+                self.motion_confirm_count + 1,
+            )
+        else:
+            self.motion_pending_sign = direction
+            self.motion_confirm_count = 1
+        if immediate_confirmed:
+            self.motion_state = "MOVING"
+            self.motion_direction = direction
+            self.motion_quiet_count = 0
+            return True
+        if self.motion_confirm_count >= required_frames:
+            if magnitude >= start_threshold:
+                self.motion_state = "MOVING"
+                self.motion_direction = direction
+                self.motion_quiet_count = 0
+                return True
+        self.motion_state = "PENDING"
+        return False
+
     def _correct(self, candidate, dt, now_ms):
         measurement_x = float(candidate["center_x"])
         measurement_y = float(candidate["center_y"])
@@ -744,27 +1105,49 @@ class PipeMotionFilter:
             0.0,
             1.0,
         )
+        motion_confirmed = self._motion_response(along, candidate)
         alpha = self.response_alpha + (
             self.alpha - self.response_alpha
         ) * response
+        if not motion_confirmed:
+            alpha = min(
+                alpha,
+                self.ambiguous_position_alpha
+                if self.measurement_ambiguous
+                else self.quiet_position_alpha,
+            )
         if not self.axis_locked:
             beta = self.response_beta + (
                 self.beta - self.response_beta
             ) * response
             self.x += alpha * residual_x
             self.y += alpha * residual_y
-            self.vx += beta * residual_x / dt
-            self.vy += beta * residual_y / dt
+            if motion_confirmed:
+                self.vx += beta * residual_x / dt
+                self.vy += beta * residual_y / dt
+            else:
+                self.vx *= self.quiet_velocity_decay
+                self.vy *= self.quiet_velocity_decay
+                if abs(self.vx) < 1.0:
+                    self.vx = 0.0
+                if abs(self.vy) < 1.0:
+                    self.vy = 0.0
             self.last_axial_innovation = math.sqrt(residual_squared)
-            self.last_measured_velocity = math.sqrt(
-                self.vx * self.vx + self.vy * self.vy
+            self.last_measured_velocity = (
+                math.sqrt(self.vx * self.vx + self.vy * self.vy)
+                if motion_confirmed
+                else 0.0
             )
-            self.fast_response_active = response >= 0.5
+            self.fast_response_active = bool(
+                motion_confirmed and response >= 0.5
+            )
             self._bound_state()
             return
 
         self.last_axial_innovation = along
-        self.fast_response_active = response >= 0.5
+        self.fast_response_active = bool(
+            motion_confirmed and response >= 0.5
+        )
         self.x += (
             alpha * along * self.axis_x
             + self.lateral_alpha * lateral * normal_x
@@ -786,7 +1169,17 @@ class PipeMotionFilter:
                 now_ms,
                 self.velocity_anchor_ms,
             )
-        if abs(measured_along) <= self.velocity_noise_px:
+        if not motion_confirmed:
+            self.last_measured_velocity = 0.0
+            along_velocity *= self.quiet_velocity_decay
+            if abs(along_velocity) < 1.0:
+                along_velocity = 0.0
+            if self.motion_state != "PENDING":
+                self.velocity_anchor_x = measurement_x
+                self.velocity_anchor_y = measurement_y
+                self.velocity_anchor_ms = int(now_ms)
+            self.velocity_braking = False
+        elif abs(measured_along) <= self.velocity_noise_px:
             self.last_measured_velocity = 0.0
             braking_innovation = (
                 along_velocity * along < 0.0
@@ -893,6 +1286,21 @@ class PipeMotionFilter:
             "measured_axial_velocity": self.last_measured_velocity,
             "fast_response": bool(self.fast_response_active),
             "velocity_braking": bool(self.velocity_braking),
+            "motion_state": self.motion_state,
+            "motion_confirm_count": min(
+                255,
+                int(self.motion_confirm_count),
+            ),
+            "motion_direction": int(self.motion_direction),
+            "motion_step_px": float(self.last_motion_step),
+            "measurement_ambiguous": bool(self.measurement_ambiguous),
+            "measurement_quality": float(self.measurement_quality),
+            "measurement_support": min(
+                255,
+                max(0, int(self.measurement_support)),
+            ),
+            "association_wide": bool(self.association_wide),
+            "association_competing": bool(self.association_competing),
         }
 
     def _advance_to_output(self, output_ms):
@@ -961,6 +1369,8 @@ class PipeMotionFilter:
             self.missed_frames = min(255, self.missed_frames + 1)
             self.vx *= self.coast_velocity_decay
             self.vy *= self.coast_velocity_decay
+            self.motion_confirm_count = 0
+            self.motion_pending_sign = 0
         if (
             self._measurement_age(now_ms) > self.max_coast_ms
             or self.missed_frames > self.max_coast_frames

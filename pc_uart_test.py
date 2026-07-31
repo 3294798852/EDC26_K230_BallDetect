@@ -335,6 +335,421 @@ def list_serial_ports():
         print("{:<12s} {}".format(port.device, port.description))
 
 
+def _tracking_candidate(
+    center_x,
+    center_y=160.0,
+    ambiguous=False,
+    quality=0.90,
+    support=None,
+    confidence=0.85,
+):
+    candidate = {
+        "confidence": float(confidence),
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "x": float(center_x) - 5.0,
+        "y": float(center_y) - 5.0,
+        "w": 10.0,
+        "h": 10.0,
+        "diameter": 10.0,
+        "edge_clipped": False,
+        "measurement_ambiguous": bool(ambiguous),
+        "measurement_quality": float(quality),
+    }
+    if support is not None:
+        candidate["support_count"] = int(support)
+    return candidate
+
+
+def _new_motion_filter(fixed_axis=True):
+    from ball_tracking import PipeMotionFilter
+
+    tracker = PipeMotionFilter(
+        acquire_confirm_frames=1,
+        fixed_axis_x=1.0 if fixed_axis else None,
+        fixed_axis_y=0.0 if fixed_axis else None,
+    )
+    state = tracker.update(_tracking_candidate(160.0), 1000)
+    assert state["track_valid"]
+    assert state["filter_reset"]
+    return tracker
+
+
+def _associated_tracking_step(tracker, candidate, now_ms):
+    selected = tracker.select_candidate([candidate], now_ms)
+    assert selected is candidate
+    return tracker.update(selected, now_ms)
+
+
+def _run_motion_filter_self_test():
+    tracker = _new_motion_filter()
+    positions = []
+    max_velocity = 0.0
+    for index, center_x in enumerate((155.0, 165.0) * 6):
+        state = tracker.update(
+            _tracking_candidate(center_x),
+            1033 + index * 33,
+        )
+        positions.append(state["x"])
+        max_velocity = max(max_velocity, abs(state["vx"]))
+    assert max_velocity < 1.0
+    assert max(positions) - min(positions) < 2.0
+    assert state["motion_state"] != "MOVING"
+
+    tracker = _new_motion_filter()
+    reliable_states = []
+    for index, center_x in enumerate((162.0, 164.0)):
+        reliable_states.append(tracker.update(
+            _tracking_candidate(center_x),
+            1033 + index * 33,
+        ))
+    assert reliable_states[0]["motion_state"] == "PENDING"
+    assert reliable_states[1]["motion_state"] == "MOVING"
+    assert reliable_states[1]["vx"] > 20.0
+
+    tracker = _new_motion_filter()
+    ambiguous_states = []
+    for index, center_x in enumerate((162.0, 164.0, 166.0)):
+        ambiguous_states.append(tracker.update(
+            _tracking_candidate(center_x, ambiguous=True),
+            1033 + index * 33,
+        ))
+    assert ambiguous_states[0]["motion_state"] == "PENDING"
+    assert ambiguous_states[1]["motion_state"] == "PENDING"
+    assert ambiguous_states[2]["motion_state"] == "MOVING"
+    assert ambiguous_states[2]["vx"] > 20.0
+
+    tracker = _new_motion_filter()
+    ambiguous_jump = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(180.0, ambiguous=True),
+        1033,
+    )
+    assert ambiguous_jump["motion_state"] == "PENDING"
+    assert abs(ambiguous_jump["vx"]) < 1.0
+    ambiguous_fast = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(195.0, ambiguous=True),
+        1066,
+    )
+    assert ambiguous_fast["motion_state"] == "PENDING"
+    assert abs(ambiguous_fast["vx"]) < 1.0
+    ambiguous_confirmed = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(210.0, ambiguous=True),
+        1099,
+    )
+    assert ambiguous_confirmed["motion_state"] == "MOVING"
+    assert not ambiguous_confirmed["filter_reset"]
+    assert ambiguous_confirmed["vx"] > 100.0
+
+    tracker = _new_motion_filter()
+    _associated_tracking_step(
+        tracker,
+        _tracking_candidate(180.0, ambiguous=True),
+        1033,
+    )
+    opposite_jump = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(145.0, ambiguous=True),
+        1066,
+    )
+    assert opposite_jump["motion_state"] == "PENDING"
+    assert abs(opposite_jump["vx"]) < 1.0
+
+    tracker = _new_motion_filter()
+    fast_pending = tracker.update(_tracking_candidate(175.0), 1033)
+    assert fast_pending["motion_state"] == "PENDING"
+    assert abs(fast_pending["vx"]) < 1.0
+    fast_state = tracker.update(_tracking_candidate(190.0), 1066)
+    assert fast_state["motion_state"] == "MOVING"
+    assert fast_state["vx"] > 100.0
+    reverse_state = tracker.update(_tracking_candidate(160.0), 1099)
+    assert reverse_state["motion_state"] == "MOVING"
+    assert reverse_state["motion_direction"] == -1
+    assert reverse_state["vx"] < -100.0
+
+    tracker = _new_motion_filter()
+    very_fast_pending = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(190.0, support=3),
+        1033,
+    )
+    assert very_fast_pending["motion_state"] == "PENDING"
+    very_fast_state = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(220.0, support=3),
+        1066,
+    )
+    assert very_fast_state["motion_state"] == "MOVING"
+    assert very_fast_state["vx"] > 300.0
+
+    tracker = _new_motion_filter()
+    false_jump = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(180.0, support=3),
+        1033,
+    )
+    assert false_jump["motion_state"] == "PENDING"
+    assert false_jump["association_wide"]
+    assert abs(false_jump["vx"]) < 1.0
+    return_state = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(160.0, support=3),
+        1066,
+    )
+    assert return_state["motion_state"] == "PENDING"
+    assert abs(return_state["vx"]) < 1.0
+    quiet_state = _associated_tracking_step(
+        tracker,
+        _tracking_candidate(160.0, support=3),
+        1099,
+    )
+    assert quiet_state["motion_state"] == "QUIET"
+    assert abs(quiet_state["x"] - 160.0) < 2.0
+
+    tracker = _new_motion_filter()
+    low_support_states = []
+    for index, center_x in enumerate((175.0, 190.0, 205.0)):
+        low_support_states.append(_associated_tracking_step(
+            tracker,
+            _tracking_candidate(center_x, support=1),
+            1033 + index * 33,
+        ))
+    assert low_support_states[0]["motion_state"] == "PENDING"
+    assert low_support_states[1]["motion_state"] == "PENDING"
+    assert low_support_states[2]["motion_state"] == "MOVING"
+    assert low_support_states[2]["measurement_ambiguous"]
+
+    tracker = _new_motion_filter()
+    near_candidate = _tracking_candidate(162.0, support=3)
+    wide_candidate = _tracking_candidate(
+        180.0,
+        support=3,
+        confidence=0.99,
+    )
+    selected = tracker.select_candidate(
+        [wide_candidate, near_candidate],
+        1033,
+    )
+    assert selected is near_candidate
+
+    tracker = _new_motion_filter()
+    weak_near_candidate = _tracking_candidate(
+        162.0,
+        support=1,
+        quality=0.50,
+    )
+    strong_wide_candidate = _tracking_candidate(
+        180.0,
+        support=3,
+        quality=0.90,
+    )
+    selected = tracker.select_candidate(
+        [weak_near_candidate, strong_wide_candidate],
+        1033,
+    )
+    assert selected is strong_wide_candidate
+
+    tracker = _new_motion_filter()
+    _associated_tracking_step(
+        tracker,
+        _tracking_candidate(180.0, support=3),
+        1033,
+    )
+    stationary_candidate = _tracking_candidate(160.0, support=3)
+    continuing_false_candidate = _tracking_candidate(195.0, support=3)
+    selected = tracker.select_candidate(
+        [continuing_false_candidate, stationary_candidate],
+        1066,
+    )
+    assert selected is stationary_candidate
+
+    tracker = _new_motion_filter()
+    closest_candidate = _tracking_candidate(164.0, support=3)
+    nearby_competitor = _tracking_candidate(170.0, support=3)
+    selected = tracker.select_candidate(
+        [nearby_competitor, closest_candidate],
+        1033,
+    )
+    assert selected is closest_candidate
+    assert selected["association_competing"]
+    competing_state = tracker.update(selected, 1033)
+    assert competing_state["measurement_ambiguous"]
+
+    tracker = _new_motion_filter()
+    low_quality_states = []
+    for index, center_x in enumerate((162.0, 164.0, 166.0)):
+        low_quality_states.append(tracker.update(
+            _tracking_candidate(
+                center_x,
+                quality=0.50,
+                support=3,
+            ),
+            1033 + index * 33,
+        ))
+    assert low_quality_states[0]["motion_state"] == "PENDING"
+    assert low_quality_states[1]["motion_state"] == "PENDING"
+    assert low_quality_states[2]["motion_state"] == "MOVING"
+
+    tracker = _new_motion_filter()
+    pending_state = tracker.update(_tracking_candidate(175.0), 1033)
+    assert pending_state["motion_state"] == "PENDING"
+    moving_state = tracker.update(_tracking_candidate(190.0), 1066)
+    assert moving_state["motion_state"] == "MOVING"
+    stop_states = []
+    for index in range(4):
+        stop_states.append(tracker.update(
+            _tracking_candidate(190.0),
+            1099 + index * 33,
+        ))
+    assert all(
+        state["motion_state"] == "MOVING"
+        for state in stop_states[:3]
+    )
+    assert stop_states[3]["motion_state"] == "QUIET"
+
+    tracker = _new_motion_filter(fixed_axis=False)
+    tracker.update(_tracking_candidate(166.0, 164.0), 1033)
+    learned_state = tracker.update(
+        _tracking_candidate(172.0, 168.0),
+        1066,
+    )
+    assert learned_state["axis_locked"]
+    assert learned_state["motion_state"] == "MOVING"
+    assert learned_state["vx"] > 0.0
+    assert learned_state["vy"] > 0.0
+
+
+def _run_hough_fusion_self_test():
+    import ball_edge_hough_detector as hough_module
+
+    original_cv_lite = hough_module.cv_lite
+    hough_module.cv_lite = object()
+    try:
+        detector = hough_module.EdgeHoughCircleDetector()
+        assert detector.min_center_distance_px == 8
+        assert detector.min_radius_px == 3
+        assert detector.max_radius_px == 9
+        assert detector.cluster_center_factor == 1.0
+        assert detector.cluster_radius_tolerance_px == 2.0
+        circles = (
+            (155.0, 160.0, 5.0),
+            (165.0, 160.5, 5.5),
+            (159.0, 159.5, 5.2),
+            (162.0, 160.0, 5.4),
+            (205.0, 160.0, 5.5),
+        )
+        candidates = []
+        for source_index, circle in enumerate(circles):
+            candidate = detector._candidate(
+                circle[0],
+                circle[1],
+                circle[2],
+                None,
+                source_index,
+            )
+            assert candidate is not None
+            candidates.append(candidate)
+        clusters = detector._cluster_candidates(candidates)
+        assert len(clusters) == 2
+        fused = []
+        for cluster_index, cluster in enumerate(clusters):
+            fused.append(detector._fuse_cluster(
+                cluster,
+                None,
+                cluster_index,
+            ))
+        fused.sort(
+            key=lambda item: item["acquisition_score"],
+            reverse=True,
+        )
+        ball = fused[0]
+        assert ball["support_count"] == 4
+        assert abs(ball["center_x"] - 160.5) < 0.0001
+        assert abs(ball["radius"] - 5.3) < 0.0001
+        assert ball["measurement_ambiguous"]
+        assert ball["acquisition_score"] > fused[1]["acquisition_score"]
+    finally:
+        hough_module.cv_lite = original_cv_lite
+
+
+def _run_pc_debug_format_self_test():
+    import contextlib
+    import io
+    import main as tracker_main
+
+    class Stub:
+        pass
+
+    detector = Stub()
+    detector.model_backend = "edge_hough"
+    detector.timing_labels = ("crop", "hough", "select")
+    detector.preprocess_ms = 1
+    detector.kpu_ms = 2
+    detector.postprocess_ms = 0
+    detector.diagnostic_text = lambda candidate=None: "H2/3/8 S2 Q80"
+
+    camera = Stub()
+    camera.exposure_text = lambda: "auto"
+
+    tx = Stub()
+    tx.sent_frames = 1
+    tx.bytes_sent = 64
+    tx.queued_bytes = lambda: 0
+    tx.write_errors = 0
+    tx.short_writes = 0
+    tx.zero_writes = 0
+    tx.dropped_error_frames = 0
+    tx.last_error = None
+
+    wifi_video = Stub()
+    wifi_video.diagnostic_text = lambda: "off"
+
+    candidate = _tracking_candidate(170.0, support=1, quality=0.50)
+    state = {
+        "x": 161.0,
+        "y": 160.0,
+        "vx": 0.0,
+        "vy": 0.0,
+        "track_valid": True,
+        "measurement_accepted": True,
+        "predicted": False,
+        "motion_state": "PENDING",
+        "motion_confirm_count": 1,
+        "motion_step_px": 10.0,
+        "measurement_ambiguous": True,
+        "measurement_quality": 0.50,
+        "measurement_support": 1,
+        "association_wide": True,
+        "association_competing": True,
+    }
+    feedback = {
+        "feedback_valid": True,
+        "feedback_saturated": False,
+    }
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        tracker_main._print_pc_debug_status(
+            1,
+            candidate,
+            state,
+            feedback,
+            3,
+            10,
+            detector,
+            camera,
+            tx,
+            wifi_video,
+            None,
+            30.0,
+            33.3,
+        )
+    text = output.getvalue()
+    assert "obs[m=PENDING1AWC" in text
+    assert "q=0.50,s=1" in text
+
+
 def run_self_test():
     from ball_calibration import (
         X_CALIBRATION_MEASURED,
@@ -404,7 +819,23 @@ def run_self_test():
     assert y_position_cm(160.0) == 0.0
     assert abs(y_position_cm(161.0) - Y_CM_PER_PIXEL) < 0.000000001
 
+    _run_hough_fusion_self_test()
+    _run_motion_filter_self_test()
+    _run_pc_debug_format_self_test()
+
     from ball_control import BallStateFeedback
+
+    default_controller = BallStateFeedback(
+        x_calibration_mode=X_CALIBRATION_MEASURED,
+    )
+    assert default_controller.kp == 8.0
+    assert default_controller.kd == 7.5
+    assert default_controller.ka == 0.0
+    assert default_controller.max_feedback_accel_cm_s2 == 140.0
+    assert default_controller.position_deadband_cm == 0.12
+    assert default_controller.velocity_deadband_cm_s == 0.40
+    assert default_controller.quiet_feedback_alpha == 0.35
+    assert default_controller.quiet_feedback_hysteresis_cm_s2 == 0.0
 
     reference_controller = BallStateFeedback(
         kp=2.0,
@@ -449,6 +880,128 @@ def run_self_test():
         raise AssertionError("out-of-range reference must fail")
     except ValueError:
         pass
+
+    control_pixel = x_pixel_for_position_cm(1.0, measured_lut)
+    control_scale = x_position_and_scale(
+        control_pixel,
+        measured_lut,
+    )[1]
+    control_state = {
+        "x": control_pixel,
+        "y": 160.0,
+        "vx": 2.0 / control_scale,
+        "vy": 0.0,
+        "track_valid": True,
+        "measurement_accepted": True,
+        "predicted": False,
+        "missed_frames": 0,
+        "measurement_age_ms": 0,
+    }
+    motion_feedback = {}
+    for motion_state in ("MOVING", "PENDING", "QUIET"):
+        state_for_mode = dict(control_state)
+        state_for_mode["motion_state"] = motion_state
+        controller_for_mode = BallStateFeedback(
+            x_calibration_mode=X_CALIBRATION_MEASURED,
+        )
+        motion_feedback[motion_state] = controller_for_mode.update(
+            state_for_mode,
+            reference_candidate,
+            1800,
+        )
+    expected_position_term = 8.0 * (1.0 - 0.12)
+    expected_velocity_term = 7.5 * (2.0 - 0.40)
+    for motion_state in ("MOVING", "PENDING"):
+        assert abs(
+            motion_feedback[motion_state][
+                "unfiltered_feedback_acceleration_cm_s2"
+            ]
+            + expected_position_term
+            + expected_velocity_term
+        ) < 0.001
+    assert abs(
+        motion_feedback["QUIET"][
+            "unfiltered_feedback_acceleration_cm_s2"
+        ]
+        + expected_position_term
+    ) < 0.001
+
+    quiet_controller = BallStateFeedback(
+        kp=8.0,
+        kd=7.5,
+        ka=0.0,
+        position_deadband_cm=0.0,
+        velocity_deadband_cm_s=0.0,
+        x_calibration_mode=X_CALIBRATION_MEASURED,
+    )
+    quiet_outputs = []
+    quiet_raw_outputs = []
+    for index in range(20):
+        position_cm = 0.8 if index % 2 == 0 else -0.8
+        quiet_state = {
+            "x": x_pixel_for_position_cm(position_cm, measured_lut),
+            "y": 160.0,
+            "vx": 200.0 if index % 2 == 0 else -200.0,
+            "vy": 0.0,
+            "track_valid": True,
+            "measurement_accepted": True,
+            "predicted": False,
+            "missed_frames": 0,
+            "measurement_age_ms": 0,
+            "motion_state": "QUIET",
+        }
+        quiet_feedback = quiet_controller.update(
+            quiet_state,
+            reference_candidate,
+            2000 + index * 33,
+        )
+        expected_position_only = -8.0 * position_cm
+        assert abs(
+            quiet_feedback["unfiltered_feedback_acceleration_cm_s2"]
+            - expected_position_only
+        ) < 0.0002
+        quiet_outputs.append(
+            quiet_feedback["feedback_acceleration_cm_s2"]
+        )
+        quiet_raw_outputs.append(
+            quiet_feedback["unfiltered_feedback_acceleration_cm_s2"]
+        )
+    assert (
+        max(quiet_outputs[-8:]) - min(quiet_outputs[-8:])
+        < 0.35 * (
+            max(quiet_raw_outputs[-8:]) - min(quiet_raw_outputs[-8:])
+        )
+    )
+    reset_state = dict(quiet_state)
+    reset_state["x"] = x_pixel_for_position_cm(1.25, measured_lut)
+    reset_state["filter_reset"] = True
+    reset_feedback = quiet_controller.update(
+        reset_state,
+        reference_candidate,
+        2700,
+    )
+    assert abs(
+        reset_feedback["feedback_acceleration_cm_s2"]
+        - reset_feedback["unfiltered_feedback_acceleration_cm_s2"]
+    ) < 0.0001
+    previous_magnitude = abs(
+        reset_feedback["feedback_acceleration_cm_s2"]
+    )
+    zero_state = dict(reset_state)
+    zero_state["x"] = x_pixel_for_position_cm(0.0, measured_lut)
+    zero_state["filter_reset"] = False
+    for index in range(20):
+        zero_feedback = quiet_controller.update(
+            zero_state,
+            reference_candidate,
+            2733 + index * 33,
+        )
+        current_magnitude = abs(
+            zero_feedback["feedback_acceleration_cm_s2"]
+        )
+        assert current_magnitude < previous_magnitude
+        previous_magnitude = current_magnitude
+    assert previous_magnitude < 0.01
 
     candidate = {
         "confidence": 0.92,

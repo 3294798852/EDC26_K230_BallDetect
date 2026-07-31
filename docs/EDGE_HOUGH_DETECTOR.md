@@ -47,6 +47,16 @@ predicted center and measured diameter increase the score of the continuous
 candidate. During acquisition, the existing tracker still requires three
 spatially consistent frames, so a one-frame false circle is not published.
 
+Native Hough can return several nearby circles for one physical ball. The
+bounded Python postprocess clusters at most 24 returned circles by compatible
+center and radius, then publishes the median center and radius of each cluster.
+Cluster support, maximum center/radius spread and geometric consistency form a
+measurement-quality value and an acquisition score. Median fusion prevents the
+selected orange box from alternating between different arc hypotheses; a
+supported cluster normally outranks an isolated false circle during acquisition.
+An excessively spread cluster is retained but marked ambiguous for stricter
+motion confirmation instead of being silently discarded.
+
 This method cannot reconstruct a circle when motion blur removes almost all
 curvature. Keep `roi_blob` and both YOLO backends available for comparison; no
 single backend is selected automatically.
@@ -62,12 +72,16 @@ adjust the `HOUGH_*` constants in `main.py`:
 | `HOUGH_AXIS_CENTER_LIMIT_PX` | 28 px | maximum accepted circle-center distance from the pipe axis |
 | `HOUGH_ENDPOINT_MARGIN_PX` | 4 px | small accepted extension beyond each pipe endpoint |
 | `HOUGH_DP` | 1 | Hough accumulator resolution ratio |
-| `HOUGH_MIN_CENTER_DISTANCE_PX` | 6 px | native suppression of nearby circle centers |
+| `HOUGH_MIN_CENTER_DISTANCE_PX` | 8 px | native suppression of nearby circle centers |
 | `HOUGH_CANNY_HIGH_THRESHOLD` | 80 | internal Canny high threshold (`param1`) |
 | `HOUGH_ACCUMULATOR_THRESHOLD` | 9 | minimum circle votes (`param2`) |
-| `HOUGH_MIN/MAX_RADIUS_PX` | 2/14 px | reject noise and large pipe/shadow structures |
+| `HOUGH_MIN/MAX_RADIUS_PX` | 3/9 px | reject noise and large pipe/shadow structures |
 | `HOUGH_TARGET_RADIUS_PX` | 5.5 px | preferred radius before a tracked diameter exists |
 | `HOUGH_MAX_RAW_CIRCLES` | 24 | hard Python postprocessing bound |
+| `HOUGH_CLUSTER_CENTER_FACTOR` | 1.0 | maximum same-ball center spread relative to diameter |
+| `HOUGH_CLUSTER_RADIUS_TOLERANCE_PX` | 2 px | maximum radius difference inside one cluster |
+| `HOUGH_TRACKED_RADIUS_TOLERANCE_PX` | 3 px | reject implausible radius changes near an active track |
+| `HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR` | 0.65 | flag a wide fused cluster for stricter motion confirmation |
 
 Lowering the Canny threshold admits weaker edges but also pipe texture. Lowering
 the accumulator threshold tolerates a shorter visible arc but increases false
@@ -87,11 +101,17 @@ The screen and PC debug line identify `edge_hough`, draw the pipe search band
 and report:
 
 ```text
-Hough c=<accepted>/<raw> h=<hint> p=<Canny>/<accumulator>
+H<accepted>/<clusters>/<raw> S<support> D<center>/<radius> Q<quality>[A]
+h<hint> P<Canny>/<accumulator>
 ```
 
-`h=1` means a non-expired motion prediction is available. A `circles clipped`
-warning means native Hough returned more than the bounded raw-candidate limit.
+`S` is the selected cluster's circle count, `D` gives maximum spread in pixels,
+`Q` is quality in percent, and `A` marks an ambiguous spread. `h=1` means a
+non-expired motion prediction is available. A `circles clipped` warning means
+native Hough returned more than the bounded raw-candidate limit. The following
+motion suffix adds `W` when the selected center is outside the strict quiet gate
+and `C` when another similarly close candidate competes with it. Both are
+diagnostics only; UART schema 6 is unchanged.
 
 Tune on the actual fixed camera in this order:
 
@@ -112,6 +132,15 @@ Tune on the actual fixed camera in this order:
    circle count and `crop/hough/select/det` timing before enabling control
    output. `hough` is the native Canny/Hough call and does not indicate KPU use.
 
+The current geometry was tightened before changing vote sensitivity: radius is
+`3..9 px`, native center separation is `8 px`, and cluster center/radius
+tolerances are `1.0`/`2 px`. The accumulator threshold deliberately remains
+`9` to preserve partial-arc and motion-blur recall. If a static scene still
+reports raw counts near `20` after this change, and the real ball remains
+reliably detected, test `HOUGH_ACCUMULATOR_THRESHOLD = 10` as a separate final
+step. `HOUGH_MAX_RAW_CIRCLES` is only a Python work bound and does not suppress
+native false circles or reduce native Hough time.
+
 Host simulation can verify parsing, gates, scoring, duplicate suppression and
 bounds. Only K230 hardware can establish actual `cv_lite` execution time,
 camera-edge quality and final thresholds under contest lighting and motion.
@@ -129,11 +158,21 @@ cyan both trail the real ball, the cause is capture exposure or detector
 geometry rather than the state filter. If only cyan trails orange, adjust the
 `TRACK_AXIAL_*` constants in `main.py`.
 
-Axial position gain rises with innovation and reaches its fast value by
-`TRACK_AXIAL_RESPONSE_FULL_PX`. Axial velocity accumulates subpixel movement
-until either `TRACK_VELOCITY_NOISE_PX` is crossed or
-`TRACK_VELOCITY_QUIET_TIMEOUT_MS` confirms a stationary interval; lowering the
-distance threshold alone converts detector jitter into speed. A sufficiently
-large innovation opposite to the current velocity activates a short braking
-latch for fast stops and reversals. Lateral position and diameter use separate
-strong smoothing and do not weaken axial response.
+The observer uses an internal `QUIET/PENDING/MOVING` state. Reliable motion
+requires two same-direction raw-center steps; an ambiguous fused cluster
+normally requires three. Low `Q`, `S<2`, spread `A`, or a close competing
+candidate also makes that measurement ambiguous. Direction-alternating Hough
+hypotheses therefore receive only slow position correction and cannot update
+velocity. There is no quiet-state one-frame fast path: even a reliable `14 px`
+step first enters `PENDING`. A second reliable same-direction step confirms
+`MOVING`, retains the velocity anchor from before the first step, and restores
+the fast correction. Its association gate expands only in the pending direction
+and is bounded by the normal maximum gate, allowing very fast travel without
+relaxing ordinary quiet tracking. If the real ball is still visible near the
+quiet prediction, it has priority over every distant continuation. Once already
+`MOVING`, a reliable large reversal remains immediate so braking is not delayed.
+Confirmed motion restores the innovation-dependent fast axial gain. Lateral
+position and diameter use separate strong smoothing and do not weaken axial
+response. The screen suffix `M<Q/P/M><count>[F][W][C]` shows this state,
+confirmation count, optional fast response, wide-gate selection and close
+competition.

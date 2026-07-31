@@ -84,27 +84,43 @@ K230 calculates a feedback-equivalent ball acceleration:
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.05) + Kd*Db(v, 1.0) + Ka*a)
+a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
 Default values are:
 
 ```text
-Kp = 16.0 1/s^2
-Kd = 7.2  1/s
+Kp = 8.0  1/s^2
+Kd = 7.5  1/s
 Ka = 0.0  dimensionless
-|a_fb| <= 250 cm/s^2
+|a_fb| <= 140 cm/s^2
 ```
 
 Physical `x` and `v` are converted directly from the single alpha-beta tracker;
-there is no second low-pass stage, avoiding extra phase lag. A continuous soft
-deadband removes the first `0.05 cm` of position and `1.0 cm/s` of velocity only
-in the feedback calculation. UART continues to publish the tracked physical
-state before this deadband. `a` remains a bounded low-pass difference of tracked
-velocity and is still published for diagnostics, but its default feedback
-coefficient is zero because camera differentiation remains noise-sensitive at
-the measured camera frame rate.
+there is no unconditional second low-pass stage, avoiding extra motion lag. A
+continuous soft deadband removes the first `0.12 cm` of position and `0.40 cm/s`
+of velocity only in the feedback calculation. UART continues to publish the
+tracked physical state before this deadband. `a` remains a bounded low-pass
+difference of tracked velocity and is still published for diagnostics, but its
+default feedback coefficient is zero because camera differentiation remains
+noise-sensitive at the measured camera frame rate.
+
+The tracker also reports an internal `QUIET/PENDING/MOVING` state. Both
+`PENDING` and confirmed `MOVING` velocity enter the `Kd` term, preserving
+braking while a stop or reversal is still being confirmed. Only `QUIET` removes
+the velocity term. A transition from `QUIET` requires at least two reliable
+same-direction center measurements; low-quality, single-support, spread or
+closely competing Hough measurements require three. The first measurement never
+creates a new velocity, while the confirming frame estimates motion from the
+pre-transition anchor. A moving track must then observe four consecutive axial
+center steps no larger than `0.75 px` before it can return to `QUIET`. Confirmed motion uses
+the raw feedback target immediately; sustained non-moving output approaches its
+target with gain `0.35`. The configured hysteresis is zero, so the filtered
+feedback continues converging to zero rather than sticking at a residual value.
+Transition away from `MOVING`, filter reset and invalid feedback reset the
+stabilization state. This changes only `a_fb`; UART still publishes the tracked
+physical `x/v/a`, and schema 6 remains exactly 64 bytes.
 
 The reference changes only the position-error term. UART still publishes the
 absolute calibrated `x` and continues to publish absolute `v/a`. Schema 6 also
@@ -128,7 +144,7 @@ K230 exposes three tracking/control states:
 
 Only a valid accepted measurement can arm `HOLD`. Acceleration state is reset
 while holding so reacquisition does not create a derivative spike; `Ka` remains
-zero by default. `FEEDBACK_SATURATED` reports the 250 cm/s2 clamp.
+zero by default. `FEEDBACK_SATURATED` reports the 140 cm/s2 clamp.
 
 ## Complete MCU control signal flow
 
@@ -198,12 +214,15 @@ the MCU has the information required for plant inversion and safety arbitration.
 
 1. Confirm the selected calibration, reference `x_ref`, image center and positive
    directions on the actual fixed camera.
-2. Log K230 `x/v/a/a_fb` while moving the ball manually with actuators disabled.
+2. Log K230 `x/v/a/a_fb`, internal motion state and raw/stabilized feedback while
+   moving the ball manually with actuators disabled.
 3. Verify `a_fb` opposes displacement and motion; a sign error must be fixed
    before enabling any MCU actuator output.
 4. Tune `Kp/Kd` with `Ka=0`, then introduce only a small `Ka` if acceleration
    feedback improves measured response without amplifying frame jitter.
-5. On the MCU, distinguish `DETECT`, bounded `HOLD`, and `LOST` from the flag
+5. With a static ball, verify the screen remains mostly `MQ`; an occasional
+   `MP1W` or `MP1C` must return without creating a velocity/feedback spike.
+6. On the MCU, distinguish `DETECT`, bounded `HOLD`, and `LOST` from the flag
    combinations. Reject stale, CRC-invalid or `FEEDBACK_VALID=0` frames.
 
 Host tests validate equations, bounds and serialization only. Camera scale,

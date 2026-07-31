@@ -145,20 +145,28 @@ enters the existing visible FATAL path rather than being silently ignored.
   spatially consistent for three consecutive frames before it can replace that
   track. Edge-clipped candidates cannot initiate a normal target switch.
 - When no track exists, a new target requires three consecutive, spatially
-  consistent, non-edge candidates with confidence at least 0.50. The
+  consistent, non-edge candidates with confidence at least 0.50. Edge-Hough
+  acquisition also ranks a median-fused circle cluster by support and geometric
+  consistency, so one isolated high-scoring false circle does not normally
+  outrank several compatible votes around the physical ball. The
   MCU can set `REACQUIRE` in a validated control-input frame to invoke
   `PipeMotionFilter.request_reacquire()` once; normal tracking remains strict.
 - `PipeMotionFilter` uses the calibrated pipe endpoints as a fixed axis from
-  the first accepted frame. Axial and lateral states are independent: axial
-  position has a small innovation noise band and rises from quiet gain `0.18`
-  to fast gain `0.96` by `1.5 px`, while lateral position uses gain `0.08`
-  and lateral velocity is forced to zero. Axial velocity follows consecutive
-  accepted measurements with fast reversal response and decays strongly when
-  displacement remains inside a cumulative `0.90 px` velocity deadband for
-  `120 ms`; the bounded accumulation preserves slow real motion instead of
-  damping every subpixel frame. A residual opposite to an established motion
-  activates a short braking latch, so stopping does not coast until the quiet
-  timeout. Apparent
+  the first accepted frame. Axial and lateral states are independent. An
+  internal `QUIET/PENDING/MOVING` hysteresis requires two reliable same-direction
+  center steps before enabling fast position and velocity correction; a
+  low-quality, single-support, spread or closely competing Hough result normally
+  requires three. No quiet-state measurement can create velocity in one frame,
+  including a step of at least `14 px`. While confirmation is pending, a
+  same-direction candidate receives a bounded speed-aware association extension;
+  the second reliable frame can therefore recover fast motion from the original
+  velocity anchor. A candidate still near the quiet prediction always outranks a
+  distant continuation, so one false jump cannot pull the track away when the
+  real stationary ball remains visible. Before confirmation, axial
+  position uses gain `0.12` (`0.10` for an ambiguous cluster), existing velocity
+  decays by `0.20`, and the measurement cannot create new velocity. Confirmed
+  motion restores the response up to gain `0.96`, while lateral position uses
+  gain `0.08` and lateral velocity is forced to zero. Apparent
   diameter uses a slow, one-pixel-bounded update because the camera geometry is
   fixed. Correction uses the capture-complete timestamp, then predicts only
   across the measured detector latency to the publish instant; this removes the
@@ -192,7 +200,7 @@ calculates only the camera-state feedback component
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.05) + Kd*Db(v, 1.0) + Ka*a)
+a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
@@ -205,14 +213,19 @@ reference command is parsed in this version. UART continues to publish absolute
 64-byte frame and also carries the active `x_ref`, `e`, zero-valued reserved
 `v_ref/a_ref`, reference source/status flags and six reserved zero bytes.
 
-Defaults are `Kp=16`, `Kd=7.2`, `Ka=0`, with `a_fb` bounded to
-`+/-250 cm/s2`. No second physical-state low-pass is applied: `x/v` are converted
+Defaults are `Kp=8.0`, `Kd=7.5`, `Ka=0`, with `a_fb` bounded to
+`+/-140 cm/s2`. No second physical-state low-pass is applied: `x/v` are converted
 directly from the single alpha-beta tracker to avoid additional phase lag.
-Continuous soft deadbands of `0.05 cm` for position and `1.0 cm/s` for velocity
+Continuous soft deadbands of `0.12 cm` for position and `0.40 cm/s` for velocity
 apply only when calculating feedback; UART still reports the tracked physical
 state itself. Acceleration remains published for diagnostics but is disabled in
-the default feedback law. These values are configurable near the top of
-`main.py` and are sent with every state frame.
+the default feedback law. Velocity damping remains active in both `PENDING` and
+`MOVING`; only `QUIET` removes the derivative term. A moving track needs four
+consecutive near-zero axial center steps before entering `QUIET`, preventing an
+early loss of braking during settling. Sustained non-moving feedback follows its
+raw target with gain `0.35` and zero hysteresis, so stationary jitter is reduced
+without leaving a nonzero stuck output. These values are configurable near the
+top of `main.py`; UART fields and the fixed 64-byte schema remain unchanged.
 
 K230 does not receive a moving `X(t)` trajectory, car acceleration or pipe
 angle and does not calculate desired pipe angle, PWM or motor commands. The
@@ -416,9 +429,10 @@ actuator safety.
 
 ## Verification boundary
 
-Host checks validate detector selection, ROI/Hough geometry and scoring with
-simulated CanMV objects, YOLO candidate normalization, association rules, feedback
-equations, fixed-point protocol and parser recovery. They cannot establish
+Host checks validate detector selection, ROI/Hough geometry, multi-circle
+fusion, single-jump rejection, quality/competition-aware motion confirmation,
+fast two-frame acquisition/reversal, association rules, feedback stabilization,
+fixed-point protocol and parser recovery. They cannot establish
 RGB565 threshold behavior, K230 execution time or camera differentiation noise. The
 camera currently requests 60 FPS; use the measured on-screen FPS and frame
 period to determine whether the active sensor/driver mode delivers it.

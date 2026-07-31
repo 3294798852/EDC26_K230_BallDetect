@@ -118,7 +118,7 @@ except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.35"
+APP_VERSION = "proj2-1.38"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -178,13 +178,17 @@ HOUGH_CROP_HALF_WIDTH_PX = 40.0
 HOUGH_AXIS_CENTER_LIMIT_PX = 28.0
 HOUGH_ENDPOINT_MARGIN_PX = 4.0
 HOUGH_DP = 1
-HOUGH_MIN_CENTER_DISTANCE_PX = 6
+HOUGH_MIN_CENTER_DISTANCE_PX = 8
 HOUGH_CANNY_HIGH_THRESHOLD = 80
 HOUGH_ACCUMULATOR_THRESHOLD = 9
-HOUGH_MIN_RADIUS_PX = 2
-HOUGH_MAX_RADIUS_PX = 14
+HOUGH_MIN_RADIUS_PX = 3
+HOUGH_MAX_RADIUS_PX = 9
 HOUGH_TARGET_RADIUS_PX = 5.5
 HOUGH_MAX_RAW_CIRCLES = 24
+HOUGH_CLUSTER_CENTER_FACTOR = 1.0
+HOUGH_CLUSTER_RADIUS_TOLERANCE_PX = 2.0
+HOUGH_TRACKED_RADIUS_TOLERANCE_PX = 3.0
+HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR = 0.65
 
 # Image-space pipe geometry used only by detection and pixel-domain tracking.
 # Physical conversion is isolated in ball_calibration.py after tracking.
@@ -200,10 +204,12 @@ X_CALIBRATION_MODE = X_CALIBRATION_MEASURED
 
 # K230 publishes only its camera-derived state-feedback term. Physical position
 # and velocity pass through continuous soft deadbands before their gains.
-FEEDBACK_KP = 16.0
-FEEDBACK_KD = 7.2
+FEEDBACK_KP = 8.0
+FEEDBACK_KD = 7.5
 FEEDBACK_KA = 0.0
-FEEDBACK_ACCEL_LIMIT_CM_S2 = 250.0
+FEEDBACK_ACCEL_LIMIT_CM_S2 = 140.0
+FEEDBACK_POSITION_DEADBAND_CM = 0.12
+FEEDBACK_VELOCITY_DEADBAND_CM_S = 0.40
 # Absolute calibrated X coordinate used as the ball equilibrium origin.
 # A future validated algorithm/MCU command may call
 # BallStateFeedback.set_reference_position_cm() to update it at runtime.
@@ -226,6 +232,21 @@ TRACK_VELOCITY_QUIET_TIMEOUT_MS = 120
 TRACK_LATERAL_ALPHA = 0.08
 TRACK_DIAMETER_ALPHA = 0.08
 TRACK_DIAMETER_MAX_STEP_PX = 1.0
+TRACK_MOTION_START_PX = 2.5
+TRACK_MOTION_IMMEDIATE_PX = 14.0
+TRACK_MOTION_CONFIRM_FRAMES = 2
+TRACK_MOTION_STOP_FRAMES = 4
+TRACK_MOTION_DIRECTION_EPSILON_PX = 0.75
+TRACK_AMBIGUOUS_POSITION_ALPHA = 0.10
+TRACK_QUIET_POSITION_ALPHA = 0.12
+TRACK_QUIET_VELOCITY_DECAY = 0.20
+TRACK_QUIET_GATE_DIAMETER_FACTOR = 1.25
+TRACK_QUIET_GATE_MIN_PX = 10.0
+TRACK_MOTION_MIN_QUALITY = 0.62
+TRACK_MOTION_MIN_SUPPORT = 2
+TRACK_ASSOCIATION_AMBIGUITY_DIAMETER_FACTOR = 0.75
+FEEDBACK_QUIET_ALPHA = 0.35
+FEEDBACK_QUIET_HYSTERESIS_CM_S2 = 0.0
 
 CAMERA_FPS = 60
 # Leave as None to preserve the camera firmware's original exposure behavior.
@@ -237,7 +258,7 @@ CAMERA_EXPOSURE_US = None
 # Optional CH1 -> hardware H.264 -> RTSP service. Real credentials belong in
 # ignored /sdcard/wifi_video_secrets.py as WIFI_VIDEO_SSID/WIFI_VIDEO_PASSWORD.
 # With no secrets file the service stays off and the vision path is unchanged.
-WIFI_VIDEO_ENABLED = True
+WIFI_VIDEO_ENABLED = False
 # Conservative debug-video profile. It reduces IDR/RTP fragmentation peaks and
 # Python/RTSP backpressure without changing CH2 detection, control or UART.
 # After a long stable test, 512x288/30/1200-1600 may be tried again as an
@@ -522,6 +543,12 @@ def _selected_model_config():
     return config
 
 
+def _detector_diagnostic_text(detector, candidate):
+    if detector.model_backend == "edge_hough":
+        return detector.diagnostic_text(candidate)
+    return detector.diagnostic_text()
+
+
 def _create_wifi_video_service():
     if not WIFI_VIDEO_ENABLED:
         return DisabledWifiVideoService("config disabled")
@@ -763,6 +790,16 @@ def _create_detector():
             target_radius_px=HOUGH_TARGET_RADIUS_PX,
             max_raw_circles=HOUGH_MAX_RAW_CIRCLES,
             max_candidates=POSTPROCESS_MAX_BOXES,
+            cluster_center_factor=HOUGH_CLUSTER_CENTER_FACTOR,
+            cluster_radius_tolerance_px=(
+                HOUGH_CLUSTER_RADIUS_TOLERANCE_PX
+            ),
+            tracked_radius_tolerance_px=(
+                HOUGH_TRACKED_RADIUS_TOLERANCE_PX
+            ),
+            ambiguous_spread_radius_factor=(
+                HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR
+            ),
         )
     if config.get("native_roi"):
         return RoiDarkBlobDetector(
@@ -1165,8 +1202,12 @@ class CameraDisplay:
         )
         self._draw_text(
             3,
-            "FB={:+.1f} kp={:.1f} kd={:.1f} ka={:.2f} {} sat={}".format(
+            "FB={:+.1f}/{:+.1f} kp={:.1f} kd={:.1f} ka={:.2f} {} sat={}".format(
                 float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+                float(feedback.get(
+                    "unfiltered_feedback_acceleration_cm_s2",
+                    0.0,
+                )),
                 float(feedback.get("kp", 0.0)),
                 float(feedback.get("kd", 0.0)),
                 float(feedback.get("ka", 0.0)),
@@ -1198,9 +1239,14 @@ class CameraDisplay:
         )
         self._draw_text(
             5,
-            "{} f={} in={:+.1f} r={} a={}/{}".format(
-                detector.diagnostic_text(),
-                1 if state.get("fast_response") else 0,
+            "{} M{}{}{}{}{} d{:+.1f} I{:+.1f} R{} A{}/{}".format(
+                _detector_diagnostic_text(detector, candidate),
+                str(state.get("motion_state", "?"))[:1],
+                int(state.get("motion_confirm_count", 0)),
+                "F" if state.get("fast_response") else "",
+                "W" if state.get("association_wide") else "",
+                "C" if state.get("association_competing") else "",
+                float(state.get("motion_step_px", 0.0)),
                 float(state.get("axial_innovation", 0.0)),
                 int(state.get("association_reject_count", 0)),
                 int(state.get("acquisition_count", 0)),
@@ -1560,10 +1606,11 @@ def _print_pc_debug_status(
     print(
         "PCDBG seq={} mode={} flags=0x{:02X} raw=({:.1f},{:.1f}) "
         "filt=({:.2f},{:.2f}) vel=({:.1f},{:.1f}) conf={:.3f} "
-        "obs[f={},in={:+.2f},vm={:+.1f}] "
+        "obs[m={}{}{}{}{},st={:+.1f},f={},in={:+.2f},vm={:+.1f},"
+        "q={:.2f},s={}] "
         "phys[p=({:+.2f},{:+.2f}),v=({:+.2f},{:+.2f}),aX={:+.1f},"
         "ref={:+.2f},e={:+.2f}] "
-        "fb[a={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
+        "fb[a={:+.1f},raw={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
         "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
         "time[cap={},{}={},{}={},{}={},det={}]ms "
         "UART[f={},b={},q={},e={},s={},z={},d={}] NET[{}] "
@@ -1578,9 +1625,17 @@ def _print_pc_debug_status(
             float(state.get("vx", 0.0)),
             float(state.get("vy", 0.0)),
             confidence,
+            str(state.get("motion_state", "?")),
+            int(state.get("motion_confirm_count", 0)),
+            "A" if state.get("measurement_ambiguous") else "",
+            "W" if state.get("association_wide") else "",
+            "C" if state.get("association_competing") else "",
+            float(state.get("motion_step_px", 0.0)),
             "Y" if state.get("fast_response") else "N",
             float(state.get("axial_innovation", 0.0)),
             float(state.get("measured_axial_velocity", 0.0)),
+            float(state.get("measurement_quality", 0.0)),
+            int(state.get("measurement_support", 0)),
             float(feedback.get("position_cm", 0.0)),
             float(feedback.get("position_y_cm", 0.0)),
             float(feedback.get("velocity_cm_s", 0.0)),
@@ -1589,13 +1644,17 @@ def _print_pc_debug_status(
             float(feedback.get("reference_position_cm", 0.0)),
             float(feedback.get("position_error_cm", 0.0)),
             float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+            float(feedback.get(
+                "unfiltered_feedback_acceleration_cm_s2",
+                0.0,
+            )),
             float(feedback.get("kp", 0.0)),
             float(feedback.get("kd", 0.0)),
             float(feedback.get("ka", 0.0)),
             "Y" if feedback.get("feedback_valid") else "N",
             "Y" if feedback.get("feedback_saturated") else "N",
             detector.model_backend,
-            detector.diagnostic_text(),
+            _detector_diagnostic_text(detector, candidate),
             X_CALIBRATION_MODE,
             camera.exposure_text(),
             float(measured_fps),
@@ -1692,6 +1751,25 @@ def main(pc_debug=False):
             lateral_alpha=TRACK_LATERAL_ALPHA,
             diameter_alpha=TRACK_DIAMETER_ALPHA,
             diameter_max_step_px=TRACK_DIAMETER_MAX_STEP_PX,
+            motion_start_px=TRACK_MOTION_START_PX,
+            motion_immediate_px=TRACK_MOTION_IMMEDIATE_PX,
+            motion_confirm_frames=TRACK_MOTION_CONFIRM_FRAMES,
+            motion_stop_frames=TRACK_MOTION_STOP_FRAMES,
+            motion_direction_epsilon_px=(
+                TRACK_MOTION_DIRECTION_EPSILON_PX
+            ),
+            ambiguous_position_alpha=TRACK_AMBIGUOUS_POSITION_ALPHA,
+            quiet_position_alpha=TRACK_QUIET_POSITION_ALPHA,
+            quiet_velocity_decay=TRACK_QUIET_VELOCITY_DECAY,
+            quiet_gate_diameter_factor=(
+                TRACK_QUIET_GATE_DIAMETER_FACTOR
+            ),
+            quiet_gate_min_px=TRACK_QUIET_GATE_MIN_PX,
+            motion_min_quality=TRACK_MOTION_MIN_QUALITY,
+            motion_min_support=TRACK_MOTION_MIN_SUPPORT,
+            association_ambiguity_diameter_factor=(
+                TRACK_ASSOCIATION_AMBIGUITY_DIAMETER_FACTOR
+            ),
             max_coast_ms=TRACK_HOLD_MAX_MS,
             max_coast_frames=TRACK_HOLD_MAX_FRAMES,
             fixed_axis_x=(
@@ -1707,6 +1785,10 @@ def main(pc_debug=False):
             kd=FEEDBACK_KD,
             ka=FEEDBACK_KA,
             max_feedback_accel_cm_s2=FEEDBACK_ACCEL_LIMIT_CM_S2,
+            position_deadband_cm=FEEDBACK_POSITION_DEADBAND_CM,
+            velocity_deadband_cm_s=(
+                FEEDBACK_VELOCITY_DEADBAND_CM_S
+            ),
             max_prediction_age_ms=TRACK_HOLD_MAX_MS,
             max_prediction_frames=TRACK_HOLD_MAX_FRAMES,
             x_calibration_mode=X_CALIBRATION_MODE,
@@ -1714,6 +1796,10 @@ def main(pc_debug=False):
             reference_state_flags=(
                 BALL_REFERENCE_FLAG_VALID
                 | BALL_REFERENCE_FLAG_SOURCE_PRESET
+            ),
+            quiet_feedback_alpha=FEEDBACK_QUIET_ALPHA,
+            quiet_feedback_hysteresis_cm_s2=(
+                FEEDBACK_QUIET_HYSTERESIS_CM_S2
             ),
         )
         stage = "detector_init"

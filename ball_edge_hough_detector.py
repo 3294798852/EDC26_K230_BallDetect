@@ -28,6 +28,17 @@ def _ticks_diff(new_value, old_value):
     return int(new_value) - int(old_value)
 
 
+def _median(values):
+    ordered = sorted(values)
+    count = len(ordered)
+    if count == 0:
+        return 0.0
+    middle = count // 2
+    if count & 1:
+        return float(ordered[middle])
+    return (float(ordered[middle - 1]) + float(ordered[middle])) * 0.5
+
+
 class EdgeHoughCircleDetector:
     """Detect small circles near a calibrated straight-pipe axis.
 
@@ -47,14 +58,18 @@ class EdgeHoughCircleDetector:
         axis_center_limit_px=28.0,
         endpoint_margin_px=4.0,
         dp=1,
-        min_center_distance_px=6,
+        min_center_distance_px=8,
         canny_high_threshold=80,
         accumulator_threshold=8,
-        min_radius_px=2,
-        max_radius_px=14,
+        min_radius_px=3,
+        max_radius_px=9,
         target_radius_px=5.5,
         max_raw_circles=24,
         max_candidates=4,
+        cluster_center_factor=1.0,
+        cluster_radius_tolerance_px=2.0,
+        tracked_radius_tolerance_px=3.0,
+        ambiguous_spread_radius_factor=0.65,
     ):
         if cv_lite is None:
             raise RuntimeError(
@@ -102,6 +117,22 @@ class EdgeHoughCircleDetector:
         )
         self.max_raw_circles = max(1, int(max_raw_circles))
         self.max_candidates = max(1, int(max_candidates))
+        self.cluster_center_factor = max(
+            0.50,
+            float(cluster_center_factor),
+        )
+        self.cluster_radius_tolerance_px = max(
+            0.5,
+            float(cluster_radius_tolerance_px),
+        )
+        self.tracked_radius_tolerance_px = max(
+            0.5,
+            float(tracked_radius_tolerance_px),
+        )
+        self.ambiguous_spread_radius_factor = max(
+            0.10,
+            float(ambiguous_spread_radius_factor),
+        )
         self.roi = self._build_roi()
         self.roi_x = int(self.roi[0])
         self.roi_y = int(self.roi[1])
@@ -114,7 +145,14 @@ class EdgeHoughCircleDetector:
         self.timing_labels = ("crop", "hough", "select")
         self.raw_circle_count = 0
         self.processed_circle_count = 0
+        self.filtered_circle_count = 0
+        self.cluster_count = 0
         self.last_detection_count = 0
+        self.selected_support_count = 0
+        self.selected_center_spread_px = 0.0
+        self.selected_radius_spread_px = 0.0
+        self.selected_measurement_quality = 0.0
+        self.selected_measurement_ambiguous = False
         self.hint_active = False
         self.last_warning = None
         self.roi_shape_checked = False
@@ -230,6 +268,12 @@ class EdgeHoughCircleDetector:
                     0.0,
                     1.0,
                 )
+            radius_tolerance = max(
+                self.tracked_radius_tolerance_px,
+                expected_radius * 0.45,
+            )
+            if abs(radius - expected_radius) > radius_tolerance:
+                return None
 
         radius_span = max(
             expected_radius - self.min_radius_px,
@@ -301,18 +345,137 @@ class EdgeHoughCircleDetector:
             "edge_clipped": edge_clipped,
             "source_index": int(source_index),
             "tracked_candidate": tracked_candidate,
+            "expected_radius": expected_radius,
         }
 
-    @staticmethod
-    def _same_circle(first, second):
-        dx = first["center_x"] - second["center_x"]
-        dy = first["center_y"] - second["center_y"]
+    def _cluster_match_distance(self, cluster, candidate):
+        seed = cluster["seed"]
+        radius_difference = abs(seed["radius"] - candidate["radius"])
+        if radius_difference > self.cluster_radius_tolerance_px:
+            return None
+        dx = seed["center_x"] - candidate["center_x"]
+        dy = seed["center_y"] - candidate["center_y"]
         center_distance = math.sqrt(dx * dx + dy * dy)
-        center_limit = max(2.0, min(first["radius"], second["radius"]) * 0.75)
-        return (
-            center_distance <= center_limit
-            and abs(first["radius"] - second["radius"]) <= 2.0
+        expected_radius = max(
+            1.0,
+            float(seed.get("expected_radius", self.target_radius_px)),
+            float(candidate.get("expected_radius", self.target_radius_px)),
         )
+        center_limit = max(
+            float(self.min_center_distance_px + 1),
+            expected_radius * 2.0 * self.cluster_center_factor,
+        )
+        if center_distance > center_limit:
+            return None
+        return center_distance
+
+    def _cluster_candidates(self, candidates):
+        clusters = []
+        candidates.sort(key=lambda item: item["confidence"], reverse=True)
+        for candidate in candidates:
+            best_cluster = None
+            best_distance = 0.0
+            for cluster in clusters:
+                distance = self._cluster_match_distance(cluster, candidate)
+                if distance is None:
+                    continue
+                if best_cluster is None or distance < best_distance:
+                    best_cluster = cluster
+                    best_distance = distance
+            if best_cluster is None:
+                clusters.append({"seed": candidate, "members": [candidate]})
+            else:
+                best_cluster["members"].append(candidate)
+        return clusters
+
+    def _fuse_cluster(self, cluster, hint_values, cluster_index):
+        members = cluster["members"]
+        center_x = _median([item["center_x"] for item in members])
+        center_y = _median([item["center_y"] for item in members])
+        radius = _median([item["radius"] for item in members])
+        fused = self._candidate(
+            center_x,
+            center_y,
+            radius,
+            hint_values,
+            cluster_index,
+        )
+        if fused is None:
+            return None
+
+        center_spread = 0.0
+        radius_spread = 0.0
+        best_confidence = 0.0
+        for member in members:
+            dx = member["center_x"] - center_x
+            dy = member["center_y"] - center_y
+            center_distance = math.sqrt(dx * dx + dy * dy)
+            if center_distance > center_spread:
+                center_spread = center_distance
+            difference = abs(member["radius"] - radius)
+            if difference > radius_spread:
+                radius_spread = difference
+            if member["confidence"] > best_confidence:
+                best_confidence = member["confidence"]
+
+        support_count = len(members)
+        expected_radius = max(
+            1.0,
+            float(fused.get("expected_radius", self.target_radius_px)),
+        )
+        center_consistency = 1.0 - _clamp(
+            center_spread / (expected_radius * 1.25),
+            0.0,
+            1.0,
+        )
+        radius_consistency = 1.0 - _clamp(
+            radius_spread / max(expected_radius * 0.60, 1.0),
+            0.0,
+            1.0,
+        )
+        support_score = min(1.0, support_count / 3.0)
+        measurement_quality = _clamp(
+            0.40 * best_confidence
+            + 0.25 * center_consistency
+            + 0.15 * radius_consistency
+            + 0.20 * support_score,
+            0.0,
+            1.0,
+        )
+        measurement_ambiguous = bool(
+            support_count > 1
+            and (
+                center_spread
+                > max(2.0, expected_radius * self.ambiguous_spread_radius_factor)
+                or radius_spread > max(1.5, expected_radius * 0.35)
+            )
+        )
+        spread_penalty = 0.12 * _clamp(
+            center_spread / max(expected_radius * 2.0, 1.0),
+            0.0,
+            1.0,
+        )
+        support_bonus = min(0.12, max(0, support_count - 1) * 0.04)
+        fused["confidence"] = _clamp(
+            fused["confidence"] + support_bonus - spread_penalty,
+            0.0,
+            1.0,
+        )
+        acquisition_score = _clamp(
+            0.65 * fused["confidence"]
+            + 0.15 * measurement_quality
+            + 0.20 * support_score
+            - (0.04 if measurement_ambiguous else 0.0),
+            0.0,
+            1.0,
+        )
+        fused["support_count"] = support_count
+        fused["center_spread_px"] = center_spread
+        fused["radius_spread_px"] = radius_spread
+        fused["measurement_quality"] = measurement_quality
+        fused["measurement_ambiguous"] = measurement_ambiguous
+        fused["acquisition_score"] = acquisition_score
+        return fused
 
     def run(self, frame, tracking_hint=None):
         self.preprocess_ms = 0
@@ -320,7 +483,14 @@ class EdgeHoughCircleDetector:
         self.postprocess_ms = 0
         self.raw_circle_count = 0
         self.processed_circle_count = 0
+        self.filtered_circle_count = 0
+        self.cluster_count = 0
         self.last_detection_count = 0
+        self.selected_support_count = 0
+        self.selected_center_spread_px = 0.0
+        self.selected_radius_spread_px = 0.0
+        self.selected_measurement_quality = 0.0
+        self.selected_measurement_ambiguous = False
         self.last_warning = None
         hint_values = self._hint_values(tracking_hint)
         self.hint_active = hint_values is not None
@@ -393,30 +563,76 @@ class EdgeHoughCircleDetector:
             if candidate is not None:
                 candidates.append(candidate)
         del circles
-        candidates.sort(key=lambda item: item["confidence"], reverse=True)
+        self.filtered_circle_count = len(candidates)
+        clusters = self._cluster_candidates(candidates)
+        self.cluster_count = len(clusters)
         selected = []
-        for candidate in candidates:
-            duplicate = False
-            for existing in selected:
-                if self._same_circle(candidate, existing):
-                    duplicate = True
-                    break
-            if duplicate:
-                continue
-            selected.append(candidate)
-            if len(selected) >= self.max_candidates:
-                break
+        for cluster_index in range(len(clusters)):
+            fused = self._fuse_cluster(
+                clusters[cluster_index],
+                hint_values,
+                cluster_index,
+            )
+            if fused is not None:
+                selected.append(fused)
+        selected.sort(
+            key=lambda item: item.get(
+                "acquisition_score",
+                item["confidence"],
+            ),
+            reverse=True,
+        )
+        if len(selected) > self.max_candidates:
+            selected = selected[:self.max_candidates]
         self.last_detection_count = len(selected)
+        if self.last_detection_count:
+            best = selected[0]
+            self.selected_support_count = int(best.get("support_count", 1))
+            self.selected_center_spread_px = float(
+                best.get("center_spread_px", 0.0)
+            )
+            self.selected_radius_spread_px = float(
+                best.get("radius_spread_px", 0.0)
+            )
+            self.selected_measurement_quality = float(
+                best.get("measurement_quality", 0.0)
+            )
+            self.selected_measurement_ambiguous = bool(
+                best.get("measurement_ambiguous")
+            )
         self.postprocess_ms = max(0, _ticks_diff(_ticks_ms(), hough_finished))
         return selected
 
-    def diagnostic_text(self):
-        text = "Hough c={}/{} h={} r={}x{} p={}/{}".format(
+    def diagnostic_text(self, selected_candidate=None):
+        support_count = self.selected_support_count
+        center_spread_px = self.selected_center_spread_px
+        radius_spread_px = self.selected_radius_spread_px
+        measurement_quality = self.selected_measurement_quality
+        measurement_ambiguous = self.selected_measurement_ambiguous
+        if selected_candidate is not None:
+            support_count = int(selected_candidate.get("support_count", 1))
+            center_spread_px = float(
+                selected_candidate.get("center_spread_px", 0.0)
+            )
+            radius_spread_px = float(
+                selected_candidate.get("radius_spread_px", 0.0)
+            )
+            measurement_quality = float(
+                selected_candidate.get("measurement_quality", 1.0)
+            )
+            measurement_ambiguous = bool(
+                selected_candidate.get("measurement_ambiguous")
+            )
+        text = "H{}/{}/{} S{} D{:.1f}/{:.1f} Q{:.0f}{} h{} P{}/{}".format(
             int(self.last_detection_count),
+            int(self.cluster_count),
             int(self.raw_circle_count),
+            int(support_count),
+            float(center_spread_px),
+            float(radius_spread_px),
+            float(measurement_quality) * 100.0,
+            "A" if measurement_ambiguous else "",
             1 if self.hint_active else 0,
-            self.roi_width,
-            self.roi_height,
             int(self.canny_high_threshold),
             int(self.accumulator_threshold),
         )

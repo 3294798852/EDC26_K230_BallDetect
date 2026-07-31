@@ -33,21 +33,23 @@ class BallStateFeedback:
 
     def __init__(
         self,
-        kp=16.0,
-        kd=7.2,
+        kp=8.0,
+        kd=7.5,
         ka=0.0,
-        max_feedback_accel_cm_s2=250.0,
+        max_feedback_accel_cm_s2=140.0,
         max_measurement_age_ms=80,
         max_prediction_age_ms=300,
         max_prediction_frames=8,
-        position_deadband_cm=0.05,
-        velocity_deadband_cm_s=1.0,
+        position_deadband_cm=0.12,
+        velocity_deadband_cm_s=0.40,
         acceleration_alpha=0.30,
         max_measured_accel_cm_s2=2000.0,
         x_calibration_mode=X_CALIBRATION_PINHOLE,
         reference_position_cm=0.0,
         max_abs_reference_position_cm=12.5,
         reference_state_flags=0,
+        quiet_feedback_alpha=0.35,
+        quiet_feedback_hysteresis_cm_s2=0.0,
     ):
         self.x_calibration_mode = str(x_calibration_mode)
         self.x_calibration_lut = get_x_calibration_lut(
@@ -89,10 +91,22 @@ class BallStateFeedback:
             1.0,
             float(max_measured_accel_cm_s2),
         )
+        self.quiet_feedback_alpha = _clamp(
+            float(quiet_feedback_alpha),
+            0.0,
+            1.0,
+        )
+        self.quiet_feedback_hysteresis_cm_s2 = max(
+            0.0,
+            float(quiet_feedback_hysteresis_cm_s2),
+        )
         self.last_update_ms = None
         self.last_velocity_cm_s = None
         self.prediction_armed = False
         self.acceleration_cm_s2 = 0.0
+        self.feedback_acceleration_cm_s2 = 0.0
+        self.feedback_initialized = False
+        self.last_motion_state = "QUIET"
 
     def set_reference_position_cm(
         self,
@@ -121,6 +135,9 @@ class BallStateFeedback:
         self.last_velocity_cm_s = None
         self.prediction_armed = False
         self.acceleration_cm_s2 = 0.0
+        self.feedback_acceleration_cm_s2 = 0.0
+        self.feedback_initialized = False
+        self.last_motion_state = "QUIET"
 
     def _physical_state(self, state):
         position_x_cm, x_cm_per_pixel = x_position_and_scale(
@@ -209,9 +226,11 @@ class BallStateFeedback:
         if state.get("filter_reset"):
             self.last_velocity_cm_s = None
             self.acceleration_cm_s2 = 0.0
+            self.feedback_acceleration_cm_s2 = 0.0
+            self.feedback_initialized = False
+            self.last_motion_state = "QUIET"
         if not feedback_current:
-            self.last_velocity_cm_s = None
-            self.acceleration_cm_s2 = 0.0
+            self.reset_runtime()
             return self._snapshot(
                 position_cm,
                 position_y_cm,
@@ -230,8 +249,12 @@ class BallStateFeedback:
             position_cm - self.reference_position_cm,
             self.position_deadband_cm,
         )
+        motion_state = str(state.get("motion_state", "MOVING"))
+        control_velocity_cm_s = velocity_cm_s
+        if motion_state not in ("MOVING", "PENDING"):
+            control_velocity_cm_s = 0.0
         feedback_velocity_cm_s = self._apply_deadband(
-            velocity_cm_s,
+            control_velocity_cm_s,
             self.velocity_deadband_cm_s,
         )
         unconstrained_feedback = -(
@@ -239,8 +262,33 @@ class BallStateFeedback:
             + self.kd * feedback_velocity_cm_s
             + self.ka * self.acceleration_cm_s2
         )
+        stabilized_feedback = unconstrained_feedback
+        if motion_state == "MOVING":
+            self.feedback_acceleration_cm_s2 = unconstrained_feedback
+            self.feedback_initialized = True
+        elif self.last_motion_state == "MOVING":
+            self.feedback_acceleration_cm_s2 = unconstrained_feedback
+            self.feedback_initialized = True
+        elif not self.feedback_initialized:
+            self.feedback_acceleration_cm_s2 = unconstrained_feedback
+            self.feedback_initialized = True
+        else:
+            difference = (
+                unconstrained_feedback
+                - self.feedback_acceleration_cm_s2
+            )
+            if abs(difference) > self.quiet_feedback_hysteresis_cm_s2:
+                if difference > 0.0:
+                    difference -= self.quiet_feedback_hysteresis_cm_s2
+                else:
+                    difference += self.quiet_feedback_hysteresis_cm_s2
+                self.feedback_acceleration_cm_s2 += (
+                    self.quiet_feedback_alpha * difference
+                )
+            stabilized_feedback = self.feedback_acceleration_cm_s2
+        self.last_motion_state = motion_state
         feedback_accel = _clamp(
-            unconstrained_feedback,
+            stabilized_feedback,
             -self.max_feedback_accel_cm_s2,
             self.max_feedback_accel_cm_s2,
         )
@@ -250,8 +298,10 @@ class BallStateFeedback:
             velocity_cm_s,
             velocity_y_cm_s,
             self.calibration_valid,
-            feedback_accel != unconstrained_feedback,
+            feedback_accel != stabilized_feedback,
             feedback_accel,
+            unconstrained_feedback,
+            motion_state,
         )
 
     def _snapshot(
@@ -263,6 +313,8 @@ class BallStateFeedback:
         feedback_valid,
         feedback_saturated,
         feedback_acceleration_cm_s2=0.0,
+        unfiltered_feedback_acceleration_cm_s2=0.0,
+        motion_state="QUIET",
     ):
         position_error_cm = 0.0
         if feedback_valid:
@@ -281,6 +333,10 @@ class BallStateFeedback:
             "feedback_acceleration_cm_s2": float(
                 feedback_acceleration_cm_s2
             ),
+            "unfiltered_feedback_acceleration_cm_s2": float(
+                unfiltered_feedback_acceleration_cm_s2
+            ),
+            "motion_state": str(motion_state),
             "feedback_valid": bool(feedback_valid),
             "feedback_saturated": bool(feedback_saturated),
             "calibration_valid": bool(self.calibration_valid),

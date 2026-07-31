@@ -214,12 +214,12 @@ Db(z, width) = sign(z) * max(abs(z) - width, 0)
 
 `FEEDBACK_REFERENCE_POSITION_CM` in `main.py` is the absolute calibrated X
 coordinate of the current equilibrium origin and defaults to `0.0 cm`.
-`BallStateFeedback.set_reference_position_cm()` provides a bounded runtime
-interface for a future validated algorithm or MCU command; no MCU-to-K230
-reference command is parsed in this version. UART continues to publish absolute
-`x/v/a` plus the feedback already computed from `e`. Schema 6 uses a fixed
-64-byte frame and also carries the active `x_ref`, `e`, zero-valued reserved
-`v_ref/a_ref`, reference source/status flags and six reserved zero bytes.
+The MCU may replace it at runtime with a fixed 10-byte CRC-protected UART
+command carrying an absolute `x_ref` in `0.01 cm` units within `+/-12.50 cm`.
+No ACK/handshake is added: the existing 64-byte state frame continuously echoes
+the applied `x_ref` and changes its source flag to `SOURCE_MCU`, so the MCU can
+confirm or safely resend the idempotent command. UART continues to publish
+absolute `x/v/a` plus feedback computed from `e=x-x_ref`.
 
 Defaults are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. Position, velocity and
 output filters use `25/50/25 ms` time constants. Position and velocity soft
@@ -243,9 +243,9 @@ seconds. Set `TOUCH_PID_ENABLED=False` to remove polling and the panel.
 
 K230 does not receive a moving `X(t)` trajectory, car acceleration or pipe
 angle and does not calculate desired pipe angle, PWM or motor commands. The
-active stationary `x_ref` is currently the K230 preset transmitted in schema
-6. The MCU combines the complete `a_fb` (already including the K230 steady
-correction) with car feedforward, performs the ball/pipe model
+active stationary `x_ref` is either the boot preset or the latest valid MCU
+command and is transmitted in schema 6. The MCU combines the complete `a_fb`
+(already including the K230 steady correction) with car feedforward, performs the ball/pipe model
 inversion and closes the measured-angle inner loop; it owns any future moving
 trajectory generator and validated command path.
 
@@ -317,10 +317,11 @@ X acceleration, final `a_fb`, `Kp/Kd/Ka`, detector time, freshness flags, active
 `x_ref`, `e=x-x_ref`, reserved reference velocity/acceleration and reference
 source/status flags. The final six payload bytes are reserved and zero. This
 schema does not add separate `Ki` or integral-state fields; LCD and PC debug
-expose them while transmitted `a_fb` already includes the full PI-D result. This
-application does not read MCU control data, does not use
-the legacy `HELLO`/`STATUS`/`ACK` handshake and never waits for a response. See
-`docs/MCU_UART_PROTOCOL.md` for exact offsets, scales, CRC and safety rules.
+expose them while transmitted `a_fb` already includes the full PI-D result.
+K230 also accepts the fixed 10-byte `SET_REFERENCE` command on IO10. It does
+not use the legacy `HELLO`/`STATUS`/`ACK` handshake and never waits for a
+response. See `docs/MCU_UART_PROTOCOL.md` for exact offsets, scales, CRC,
+state-frame confirmation and safety rules.
 
 ## Optional Wi-Fi video
 

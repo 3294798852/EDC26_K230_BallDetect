@@ -52,12 +52,17 @@ if not K230_RUNTIME:
         BALL_REFERENCE_FLAG_VALID,
         BALL_STATE_FRAME_SIZE,
         BALL_STATE_PAYLOAD_SIZE,
+        REFERENCE_COMMAND_FRAME_SIZE,
+        ReferenceCommandParser,
         UART_HEADER_SIZE,
         UART_SYNC_0,
         UART_SYNC_1,
         crc16_ccitt_false,
+        decode_reference_command_frame,
         decode_ball_state_frame,
+        encode_reference_command_frame,
         encode_ball_state_frame,
+        validate_reference_command_frame,
         validate_ball_state_frame,
     )
 else:
@@ -703,6 +708,15 @@ def _run_pc_debug_format_self_test():
     tx.dropped_error_frames = 0
     tx.last_error = None
 
+    rx = Stub()
+    rx.parser = Stub()
+    rx.parser.bytes_received = 10
+    rx.parser.invalid_frames = 0
+    rx.applied_commands = 1
+    rx.read_errors = 0
+    rx.last_applied_cm = 1.25
+    rx.last_error = None
+
     wifi_video = Stub()
     wifi_video.diagnostic_text = lambda: "off"
 
@@ -740,6 +754,7 @@ def _run_pc_debug_format_self_test():
             detector,
             camera,
             tx,
+            rx,
             wifi_video,
             None,
             None,
@@ -819,6 +834,78 @@ def run_self_test():
     assert abs(x_center_scale(measured_lut) - 0.0789) < 0.000000001
     assert y_position_cm(160.0) == 0.0
     assert abs(y_position_cm(161.0) - Y_CM_PER_PIXEL) < 0.000000001
+
+    reference_positive = encode_reference_command_frame(2.50)
+    reference_negative = encode_reference_command_frame(-12.50)
+    reference_zero = encode_reference_command_frame(0.0)
+    assert len(reference_positive) == REFERENCE_COMMAND_FRAME_SIZE == 10
+    assert validate_reference_command_frame(reference_positive)
+    assert validate_reference_command_frame(reference_negative)
+    assert validate_reference_command_frame(reference_zero)
+    assert decode_reference_command_frame(reference_positive) == 2.50
+    assert decode_reference_command_frame(reference_negative) == -12.50
+    assert decode_reference_command_frame(reference_zero) == 0.0
+    try:
+        encode_reference_command_frame(12.51)
+        raise AssertionError("out-of-range reference command must fail")
+    except ValueError:
+        pass
+    corrupted_reference = bytearray(reference_positive)
+    corrupted_reference[6] ^= 0x01
+    assert not validate_reference_command_frame(corrupted_reference)
+    overflow_reference = bytearray(reference_positive)
+    overflow_reference[6] = 0xE3
+    overflow_reference[7] = 0x04
+    overflow_crc = crc16_ccitt_false(overflow_reference, 2, 8)
+    overflow_reference[8] = overflow_crc & 0xFF
+    overflow_reference[9] = (overflow_crc >> 8) & 0xFF
+    assert not validate_reference_command_frame(overflow_reference)
+    reference_parser = ReferenceCommandParser()
+    assert reference_parser.feed(b"\x00\xA5" + reference_positive[:3]) is None
+    assert reference_parser.feed(reference_positive[3:]) == 2.50
+    latest_reference = reference_parser.feed(
+        corrupted_reference + reference_negative + reference_zero
+    )
+    assert latest_reference == 0.0
+    assert reference_parser.valid_frames == 3
+    assert reference_parser.invalid_frames >= 1
+
+    import main as tracker_main
+
+    class FakeReferenceController:
+        def __init__(self):
+            self.reference_position_cm = 0.0
+            self.reference_state_flags = 0
+
+        def set_reference_position_cm(self, value, flags):
+            self.reference_position_cm = float(value)
+            self.reference_state_flags = int(flags)
+            return self.reference_position_cm
+
+    class FakeReferenceUart:
+        def __init__(self, data):
+            self.data = bytes(data)
+
+        def any(self):
+            return len(self.data)
+
+        def read(self, size):
+            chunk = self.data[:int(size)]
+            self.data = self.data[int(size):]
+            return chunk
+
+    tracker_main.ReferenceCommandParser = ReferenceCommandParser
+    fake_controller = FakeReferenceController()
+    command_rx = tracker_main.UartReferenceCommandRx(
+        FakeReferenceUart(reference_positive + reference_negative),
+        fake_controller,
+    )
+    assert command_rx.poll() == -12.50
+    assert fake_controller.reference_position_cm == -12.50
+    assert fake_controller.reference_state_flags == (
+        BALL_REFERENCE_FLAG_VALID | BALL_REFERENCE_FLAG_SOURCE_MCU
+    )
+    assert command_rx.applied_commands == 1
 
     _run_hough_fusion_self_test()
     _run_motion_filter_self_test()

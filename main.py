@@ -1,8 +1,8 @@
-"""Standalone K230 steel-ball tracker with filtered UART output.
+"""Standalone K230 steel-ball tracker with filtered UART control/state.
 
-This entry intentionally has no command handshake or task supervisor.  It
-starts the camera, detector, constrained motion filter, UART and lightweight
-overlay once, then continuously publishes the newest 64-byte state frame.
+This entry has no command handshake or task supervisor. It starts the camera,
+detector, constrained motion filter, UART and lightweight overlay once, then
+accepts bounded set-reference commands and publishes the newest state frame.
 """
 
 import gc
@@ -35,6 +35,7 @@ EdgeHoughCircleDetector = None
 WifiVideoService = None
 DisabledWifiVideoService = None
 encode_ball_state_frame = None
+ReferenceCommandParser = None
 x_pixel_for_position_cm = None
 get_x_calibration_lut = None
 X_CALIBRATION_MEASURED = "measured_distortion"
@@ -51,6 +52,7 @@ BALL_FLAG_FEEDBACK_SATURATED = 0x80
 BALL_STATE_FRAME_SIZE = 64
 BALL_REFERENCE_FLAG_VALID = 0x0001
 BALL_REFERENCE_FLAG_SOURCE_PRESET = 0x0002
+BALL_REFERENCE_FLAG_SOURCE_MCU = 0x0008
 
 _BOOT_IMPORT_ERROR = None
 _BOOT_IMPORT_STAGE = None
@@ -95,8 +97,10 @@ try:
         BALL_FLAG_RAW_DETECTED,
         BALL_FLAG_TRACK_VALID,
         BALL_REFERENCE_FLAG_SOURCE_PRESET,
+        BALL_REFERENCE_FLAG_SOURCE_MCU,
         BALL_REFERENCE_FLAG_VALID,
         BALL_STATE_FRAME_SIZE,
+        ReferenceCommandParser,
         encode_ball_state_frame,
     )
     _BOOT_IMPORT_STAGE = "import_ball_tracking"
@@ -124,7 +128,7 @@ except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.53"
+APP_VERSION = "proj2-1.60"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -317,6 +321,7 @@ MAX_CONSECUTIVE_FRAME_ERRORS = 3
 
 UART_BAUDRATE = 512000
 UART_MAX_WRITE_BYTES = 64
+UART_MAX_READ_BYTES = 32
 
 UART_SOFTWARE_FRAME_CAPACITY = 2
 UART_SOFTWARE_BUFFER_BYTES = (
@@ -1337,6 +1342,7 @@ class CameraDisplay:
         capture_interval_ms,
         detector,
         tx,
+        rx,
         wifi_video,
         pid_tuner=None,
         runtime_error=None,
@@ -1502,31 +1508,35 @@ class CameraDisplay:
         )
         self._draw_text(
             6,
-            "UART TX f={} b={} repl={} q={}/{}B".format(
+            "UART TX f={} b={} q={} RX ok={} bad={} ref={:+.2f}".format(
                 tx.sent_frames,
                 tx.bytes_sent,
-                tx.replaced_frames,
                 tx.queued_bytes(),
-                UART_SOFTWARE_BUFFER_BYTES,
+                rx.applied_commands,
+                rx.parser.invalid_frames,
+                rx.last_applied_cm,
             ),
             COLOR_GOOD,
         )
         self._draw_text(
             7,
-            "UART err={} short={} zero={} drop={}".format(
+            "UART err tx={} short={} zero={} drop={} rx={}".format(
                 tx.write_errors,
                 tx.short_writes,
                 tx.zero_writes,
                 tx.dropped_error_frames,
+                rx.read_errors,
             ),
             COLOR_BAD if (
                 tx.write_errors or tx.short_writes or tx.zero_writes
-                or tx.dropped_error_frames
+                or tx.dropped_error_frames or rx.read_errors
             ) else COLOR_GOOD,
         )
         visible_error = runtime_error
         if visible_error is None:
             visible_error = tx.last_error
+        if visible_error is None:
+            visible_error = rx.last_error
         if (
             visible_error is None
             and pid_tuner is not None
@@ -1762,6 +1772,78 @@ class LatestFrameUartTx:
         return total
 
 
+class UartReferenceCommandRx:
+    """Bounded non-blocking receiver for MCU set-reference commands."""
+
+    def __init__(self, reader, controller):
+        if (
+            reader is None
+            or not hasattr(reader, "any")
+            or not hasattr(reader, "read")
+        ):
+            raise ValueError("UART reader must provide any() and read()")
+        self.reader = reader
+        self.controller = controller
+        self.parser = ReferenceCommandParser()
+        self.read_calls = 0
+        self.read_errors = 0
+        self.applied_commands = 0
+        self.last_applied_cm = float(controller.reference_position_cm)
+        self.last_error = None
+
+    def poll(self):
+        """Read at most one bounded chunk and apply only the newest command."""
+        try:
+            waiting = self.reader.any()
+            if waiting is None:
+                return None
+            waiting = int(waiting)
+            if waiting <= 0:
+                return None
+            data = self.reader.read(min(waiting, UART_MAX_READ_BYTES))
+        except Exception as exc:
+            if _is_ide_interrupt(exc):
+                raise KeyboardInterrupt()
+            self.read_errors += 1
+            self.last_error = "UART RX {}: {}".format(
+                type(exc).__name__,
+                exc,
+            )
+            if self.read_errors == 1 or self.read_errors % 20 == 0:
+                print(self.last_error)
+            return None
+        self.read_calls += 1
+        if data is None or len(data) == 0:
+            return None
+        reference_position_cm = self.parser.feed(data)
+        if reference_position_cm is None:
+            return None
+        try:
+            applied_cm = self.controller.set_reference_position_cm(
+                reference_position_cm,
+                BALL_REFERENCE_FLAG_VALID
+                | BALL_REFERENCE_FLAG_SOURCE_MCU,
+            )
+        except Exception as exc:
+            self.read_errors += 1
+            self.last_error = "UART REF {}: {}".format(
+                type(exc).__name__,
+                exc,
+            )
+            print(self.last_error)
+            return None
+        self.applied_commands += 1
+        self.last_applied_cm = float(applied_cm)
+        self.last_error = None
+        print(
+            "UART reference applied x_ref={:+.2f}cm count={}".format(
+                self.last_applied_cm,
+                self.applied_commands,
+            )
+        )
+        return self.last_applied_cm
+
+
 
 def _open_uart():
     fpioa = FPIOA()
@@ -1841,6 +1923,7 @@ def _print_pc_debug_status(
     detector,
     camera,
     tx,
+    rx,
     wifi_video,
     pid_tuner,
     runtime_error,
@@ -1869,7 +1952,8 @@ def _print_pc_debug_status(
         "ka={:.3f},I={:+.2f},F={:+.2f},is={},valid={},sat={}] "
         "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
         "time[cap={},{}={},{}={},{}={},det={}]ms "
-        "UART[f={},b={},q={},e={},s={},z={},d={}] NET[{}] TOUCH[{}] "
+        "UART[txf={},txb={},q={},e={},s={},z={},d={},rxb={},rxok={},"
+        "rxbad={},rxerr={},ref={:+.2f}] NET[{}] TOUCH[{}] "
         "uart_last={} runtime_last={}".format(
             int(sequence),
             _tracking_mode(state, feedback),
@@ -1938,6 +2022,11 @@ def _print_pc_debug_status(
             tx.short_writes,
             tx.zero_writes,
             tx.dropped_error_frames,
+            rx.parser.bytes_received,
+            rx.applied_commands,
+            rx.parser.invalid_frames,
+            rx.read_errors,
+            rx.last_applied_cm,
             wifi_video.diagnostic_text(),
             "OFF" if pid_tuner is None else pid_tuner.diagnostic_text(),
             str(tx.last_error)[:48],
@@ -1984,6 +2073,7 @@ def _hold_fatal(camera, stage, exc, tx):
 def main(pc_debug=False):
     uart = None
     tx = None
+    rx = None
     camera = None
     detector = None
     tracker = None
@@ -2073,6 +2163,8 @@ def main(pc_debug=False):
             breakaway_accel_cm_s2=FEEDBACK_BREAKAWAY_ACCEL_CM_S2,
             breakaway_transition_cm=FEEDBACK_BREAKAWAY_TRANSITION_CM,
         )
+        stage = "uart_rx_init"
+        rx = UartReferenceCommandRx(uart, feedback_filter)
         stage = "touch_pid_init"
         pid_tuner = TouchPidTuner(feedback_filter)
         stage = "detector_init"
@@ -2129,6 +2221,8 @@ def main(pc_debug=False):
         while True:
             _exitpoint()
             tx.poll()
+            stage = "uart_command_poll"
+            rx.poll()
             stage = "touch_pid_poll"
             pid_tuner.poll(_ticks_ms())
             candidate = None
@@ -2277,6 +2371,7 @@ def main(pc_debug=False):
                     capture_interval_ms,
                     detector,
                     tx,
+                    rx,
                     wifi_video,
                     pid_tuner=pid_tuner,
                     runtime_error=latched_runtime_error,
@@ -2298,6 +2393,7 @@ def main(pc_debug=False):
                     detector,
                     camera,
                     tx,
+                    rx,
                     wifi_video,
                     pid_tuner,
                     latched_runtime_error,

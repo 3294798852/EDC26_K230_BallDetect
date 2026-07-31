@@ -3,8 +3,9 @@
 ## Scope and physical link
 
 This standalone application publishes camera-derived image state, physical
-ball state and a bounded feedback component. It does not use the legacy task
-handshake and does not require MCU-to-K230 control data.
+ball state and a bounded feedback component. The MCU may send one compact
+command to update the stationary equilibrium reference. There is no legacy
+task handshake and K230 never waits for a command or acknowledgement.
 
 Physical fields use the compile-time `X_CALIBRATION_MODE` selected in
 `main.py`. The default `measured_distortion` table corrects the installed
@@ -16,16 +17,57 @@ during system calibration; the LCD physical-state row and PC debug identify it.
 | Item | Value |
 | --- | --- |
 | K230 peripheral | UART1 |
-| K230 pins | IO9 TX, IO10 RX (RX currently unused by this application) |
-| MCU connection | K230 IO9 TX -> MCU RX; common ground |
+| K230 pins | IO9 TX, IO10 RX |
+| MCU connection | K230 IO9 TX -> MCU RX; K230 IO10 RX <- MCU TX; common ground |
 | Format | 512000 baud, 8N1, no flow control |
 | Levels | 3.3 V TTL |
-| Direction | K230 to MCU |
-| Frame size | fixed 64 bytes |
+| Direction | bidirectional |
+| Frames | K230 state 64 bytes; MCU command 10 bytes |
 
 K230 never waits for an MCU response. UART writes use a bounded two-frame,
 latest-wins queue, so a disconnected receiver cannot block camera processing or
 cause unbounded memory growth.
+
+## MCU set-reference command
+
+To set the stationary balance point, send exactly 10 bytes. Multibyte fields
+are little-endian. `x_ref_i16 = round(x_ref_cm * 100)` and the accepted range is
+`-1250..+1250` (`-12.50..+12.50 cm`). This is an absolute calibrated physical X
+coordinate using the same sign convention as state-frame `x`, not a pixel
+coordinate or a relative movement.
+
+| Offset | Size | Field | Value |
+| ---: | ---: | --- | --- |
+| 0 | 1 | sync 0 | `0xA5` |
+| 1 | 1 | sync 1 | `0x5A` |
+| 2 | 1 | protocol version | `1` |
+| 3 | 1 | message type | `0x10` (`SET_REFERENCE`) |
+| 4 | 1 | command schema | `1` |
+| 5 | 1 | flags | `0` |
+| 6..7 | 2 | reference | signed `i16`, `/100 cm` |
+| 8..9 | 2 | CRC16 | over offsets `2..7` |
+
+Known-good complete frame examples:
+
+```text
+x_ref =  0.00 cm: A5 5A 01 10 01 00 00 00 5E 39
+x_ref = +2.50 cm: A5 5A 01 10 01 00 FA 00 54 C5
+x_ref = -2.50 cm: A5 5A 01 10 01 00 06 FF 08 8D
+```
+
+CRC16-CCITT-FALSE uses polynomial `0x1021`, initial `0xFFFF`, no reflection and
+no final xor. Invalid sync/version/type/schema/flags/range/CRC commands are
+discarded without changing the current reference. The parser accepts split and
+coalesced frames, resynchronizes after noise, uses fixed memory, and reads at
+most 32 UART bytes per camera loop.
+
+The operation is idempotent. No separate ACK frame is sent. After applying the
+command, K230 continuously reports the quantized applied value in state-frame
+payload `x_ref` and reports reference flags `REFERENCE_VALID|SOURCE_MCU`
+(`0x0009`). The MCU should regard that state-frame echo as confirmation. If it
+is not observed within a bounded timeout, the MCU may resend the same 10-byte
+command a limited number of times; duplicate commands are harmless. A command
+does not reset tracking or the learned integral correction.
 
 ## Envelope
 
@@ -155,12 +197,13 @@ feedback component, not a desired pipe angle or actuator/PWM command.
 | 0 | `REFERENCE_VALID` | `x_ref` and the reference-state fields are valid |
 | 1 | `SOURCE_PRESET` | reference comes from `FEEDBACK_REFERENCE_POSITION_CM` |
 | 2 | `SOURCE_ALGORITHM` | reserved for a future K230 algorithm-selected reference |
-| 3 | `SOURCE_MCU` | reserved for a future validated MCU command reference |
+| 3 | `SOURCE_MCU` | reference was set by a valid MCU command |
 | 4 | `SLEW_ACTIVE` | reference is moving through a bounded ramp |
 | 5..15 | reserved | schema 6 requires zero |
 
-Current firmware sends `REFERENCE_VALID|SOURCE_PRESET` (`0x0003`). Exactly one
-source bit should be set when `REFERENCE_VALID=1`. Unsupported or contradictory
+At boot firmware sends `REFERENCE_VALID|SOURCE_PRESET` (`0x0003`). After a
+valid command it sends `REFERENCE_VALID|SOURCE_MCU` (`0x0009`). Exactly one
+source bit must be set when `REFERENCE_VALID=1`. Unsupported or contradictory
 source flags must be logged and rejected from safety-critical use.
 
 ## MCU use
@@ -186,8 +229,8 @@ flags.
 The MCU owns:
 
 - any future moving-trajectory `X(t)`, `X_dot(t)`, `X_ddot(t)` generation and
-  its validated command transport; the current active stationary `x_ref` is a
-  K230 preset and is reported in every frame;
+  its validated command transport; the current stationary `x_ref` is the K230
+  boot preset or latest valid MCU command and is reported in every frame;
 - car-acceleration sensing/feedforward;
 - any independently designed moving-trajectory term; K230 already owns the
   stationary ball-position PI-D correction inside `a_fb`;
@@ -213,8 +256,8 @@ carried a desired angle at payload 28..29; neither may be decoded as schema 6.
 ## Verification boundary
 
 K230 host tests cover fixed length, scales, signed values, CRC, split/coalesced
-frames, noise recovery, motion hysteresis, PI-D anti-windup and feedback
-stabilization/bounds.
+state and command frames, noise recovery, command range rejection, reference
+application, motion hysteresis, PI-D anti-windup and feedback stabilization.
 The MCU decoder has not been modified in this task and must be updated
 separately for schema 6. End-to-end
 UART, sign convention, physical calibration, controller composition and

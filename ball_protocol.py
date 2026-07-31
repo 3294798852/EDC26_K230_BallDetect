@@ -10,6 +10,7 @@ UART_SYNC_0 = 0xA5
 UART_SYNC_1 = 0x5A
 UART_PROTOCOL_VERSION = 1
 UART_MSG_VISION_EVENT = 0x02
+UART_MSG_SET_REFERENCE = 0x10
 UART_FRAME_FLAG_REALTIME = 1 << 0
 
 BALL_STATE_SCHEMA_VERSION = 6
@@ -20,6 +21,12 @@ UART_CRC_SIZE = 2
 BALL_STATE_FRAME_SIZE = (
     UART_HEADER_SIZE + BALL_STATE_PAYLOAD_SIZE + UART_CRC_SIZE
 )
+
+REFERENCE_COMMAND_SCHEMA_VERSION = 1
+REFERENCE_COMMAND_FLAGS = 0
+REFERENCE_COMMAND_POSITION_SCALE = 100
+REFERENCE_COMMAND_MAX_ABS_CM = 12.5
+REFERENCE_COMMAND_FRAME_SIZE = 10
 
 BALL_FLAG_RAW_DETECTED = 1 << 0
 BALL_FLAG_MEASUREMENT_ACCEPTED = 1 << 1
@@ -117,6 +124,139 @@ def crc16_ccitt_false(buffer, start=0, end=None):
             else:
                 crc = (crc << 1) & 0xFFFF
     return crc
+
+
+def encode_reference_command_frame(reference_position_cm):
+    """Encode one fixed command that sets the K230 equilibrium reference."""
+    reference_position_cm = float(reference_position_cm)
+    if (
+        reference_position_cm != reference_position_cm
+        or abs(reference_position_cm) > REFERENCE_COMMAND_MAX_ABS_CM
+    ):
+        raise ValueError("reference command must be within +/-12.50 cm")
+    frame = bytearray(REFERENCE_COMMAND_FRAME_SIZE)
+    frame[0] = UART_SYNC_0
+    frame[1] = UART_SYNC_1
+    frame[2] = UART_PROTOCOL_VERSION
+    frame[3] = UART_MSG_SET_REFERENCE
+    frame[4] = REFERENCE_COMMAND_SCHEMA_VERSION
+    frame[5] = REFERENCE_COMMAND_FLAGS
+    _put_i16(
+        frame,
+        6,
+        _round_int(
+            reference_position_cm * REFERENCE_COMMAND_POSITION_SCALE
+        ),
+    )
+    _put_u16(frame, 8, crc16_ccitt_false(frame, 2, 8))
+    return frame
+
+
+def validate_reference_command_frame(frame):
+    if frame is None or len(frame) != REFERENCE_COMMAND_FRAME_SIZE:
+        return False
+    if int(frame[0]) != UART_SYNC_0 or int(frame[1]) != UART_SYNC_1:
+        return False
+    if int(frame[2]) != UART_PROTOCOL_VERSION:
+        return False
+    if int(frame[3]) != UART_MSG_SET_REFERENCE:
+        return False
+    if int(frame[4]) != REFERENCE_COMMAND_SCHEMA_VERSION:
+        return False
+    if int(frame[5]) != REFERENCE_COMMAND_FLAGS:
+        return False
+    if abs(_get_i16(frame, 6)) > int(
+        REFERENCE_COMMAND_MAX_ABS_CM * REFERENCE_COMMAND_POSITION_SCALE
+    ):
+        return False
+    return _get_u16(frame, 8) == crc16_ccitt_false(frame, 2, 8)
+
+
+def decode_reference_command_frame(frame):
+    if not validate_reference_command_frame(frame):
+        raise ValueError("invalid set-reference UART command")
+    return _get_i16(frame, 6) / float(REFERENCE_COMMAND_POSITION_SCALE)
+
+
+class ReferenceCommandParser:
+    """Fixed-memory parser for split, coalesced and noisy command streams."""
+
+    def __init__(self):
+        self.frame = bytearray(REFERENCE_COMMAND_FRAME_SIZE)
+        self.index = 0
+        self.bytes_received = 0
+        self.valid_frames = 0
+        self.invalid_frames = 0
+        self.discarded_bytes = 0
+
+    def _restart_after_invalid_frame(self):
+        restart = -1
+        for offset in range(1, REFERENCE_COMMAND_FRAME_SIZE - 1):
+            if (
+                int(self.frame[offset]) == UART_SYNC_0
+                and int(self.frame[offset + 1]) == UART_SYNC_1
+            ):
+                restart = offset
+        if restart < 0:
+            if int(self.frame[REFERENCE_COMMAND_FRAME_SIZE - 1]) == UART_SYNC_0:
+                self.frame[0] = UART_SYNC_0
+                self.index = 1
+                self.discarded_bytes += REFERENCE_COMMAND_FRAME_SIZE - 1
+            else:
+                self.index = 0
+                self.discarded_bytes += REFERENCE_COMMAND_FRAME_SIZE
+            return
+        remaining = REFERENCE_COMMAND_FRAME_SIZE - restart
+        for target in range(remaining):
+            self.frame[target] = self.frame[restart + target]
+        self.index = remaining
+        self.discarded_bytes += restart
+
+    def _consume_byte(self, value):
+        value = int(value) & 0xFF
+        if self.index == 0:
+            if value == UART_SYNC_0:
+                self.frame[0] = value
+                self.index = 1
+            else:
+                self.discarded_bytes += 1
+            return None
+        if self.index == 1:
+            if value == UART_SYNC_1:
+                self.frame[1] = value
+                self.index = 2
+            elif value == UART_SYNC_0:
+                self.frame[0] = value
+                self.discarded_bytes += 1
+            else:
+                self.index = 0
+                self.discarded_bytes += 2
+            return None
+
+        self.frame[self.index] = value
+        self.index += 1
+        if self.index < REFERENCE_COMMAND_FRAME_SIZE:
+            return None
+        if validate_reference_command_frame(self.frame):
+            reference_position_cm = decode_reference_command_frame(self.frame)
+            self.valid_frames += 1
+            self.index = 0
+            return reference_position_cm
+        self.invalid_frames += 1
+        self._restart_after_invalid_frame()
+        return None
+
+    def feed(self, data):
+        """Return the newest valid reference in this chunk, or None."""
+        latest_reference = None
+        if data is None:
+            return None
+        self.bytes_received += len(data)
+        for value in data:
+            decoded = self._consume_byte(value)
+            if decoded is not None:
+                latest_reference = decoded
+        return latest_reference
 
 
 def _candidate_value(candidate, name, default=0):

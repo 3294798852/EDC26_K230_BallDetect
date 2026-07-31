@@ -3,12 +3,12 @@
 ## Responsibility boundary
 
 K230 owns the camera-derived ball state, the currently applied constant
-equilibrium preset `x_ref`, and the resulting feedback component. It does not
+equilibrium reference `x_ref`, and the resulting feedback component. It does not
 receive a moving reference trajectory, car acceleration or measured pipe
 angle, and it does not calculate a pipe-angle, PWM or motor command.
 
 ```text
-K230: preset x_ref + image -> tracked/calibrated x, v, a
+K230: preset/MCU x_ref + image -> tracked/calibrated x, v, a
       -> e=x-x_ref -> filtered PI-D -> a_fb
 MCU:  car feedforward + a_fb -> plant inversion -> angle inner loop
 ```
@@ -18,8 +18,9 @@ rolling-ball/pipe model, desired-angle calculation, measured pipe-angle
 feedback, actuator limits, fault handling and safe state. If a moving
 trajectory `X(t)/X_dot(t)/X_ddot(t)` is introduced later, its generation and
 the validated command path are also MCU responsibilities; the current firmware
-implements only the K230-side stationary `x_ref` preset and does not receive
-that trajectory.
+implements only a stationary `x_ref`; the MCU may update that constant with the
+bounded command in `docs/MCU_UART_PROTOCOL.md`, but K230 does not receive a
+moving reference trajectory.
 
 ## Coordinate calibration
 
@@ -73,12 +74,14 @@ point as an absolute calibrated X coordinate. It currently defaults to
 `0.0 cm`. Positive and negative values move the balance point right or left in
 the same sign convention as transmitted `x`.
 
-`BallStateFeedback.set_reference_position_cm(value)` is a bounded runtime
-interface for future reference-selection logic. It accepts only finite values
-within `+/-12.5 cm`. The current application does not parse an MCU command and
-does not silently change the reference at runtime. A later command interface
-should rate-limit or ramp large reference changes, because an instantaneous
-step `Delta x_ref` changes the proportional target by `Kp*Delta x_ref`.
+`BallStateFeedback.set_reference_position_cm(value)` is the bounded runtime
+interface. It accepts only finite values within `+/-12.5 cm`. A valid fixed
+10-byte MCU command applies an absolute reference in `0.01 cm` units and changes
+the state-frame source to `SOURCE_MCU`. The existing state-frame `x_ref` echo is
+the confirmation; there is no separate ACK. An instantaneous step
+`Delta x_ref` changes the proportional target by `Kp*Delta x_ref`, so the MCU
+must command only references appropriate for the active plant and actuator
+limits.
 Changing the reference preserves the current integral correction. A full
 runtime/filter reset clears that correction together with the filtered state.
 

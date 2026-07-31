@@ -7,3 +7,4 @@ Thumbs.db
 
 # Device-local configuration may contain Wi-Fi and API credentials.
 configs/sys_config.json
+wifi_video_secrets.py

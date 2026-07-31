@@ -31,6 +31,8 @@ normalize_postprocessed_ball_candidates = None
 BallStateFeedback = None
 RoiDarkBlobDetector = None
 EdgeHoughCircleDetector = None
+WifiVideoService = None
+DisabledWifiVideoService = None
 encode_ball_state_frame = None
 x_pixel_for_position_cm = None
 get_x_calibration_lut = None
@@ -109,12 +111,14 @@ try:
     from ball_roi_detector import RoiDarkBlobDetector
     _BOOT_IMPORT_STAGE = "import_ball_edge_hough_detector"
     from ball_edge_hough_detector import EdgeHoughCircleDetector
+    _BOOT_IMPORT_STAGE = "import_wifi_video_service"
+    from wifi_video_service import DisabledWifiVideoService, WifiVideoService
     _BOOT_IMPORT_STAGE = None
 except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.28"
+APP_VERSION = "proj2-1.35"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -229,6 +233,33 @@ CAMERA_FPS = 60
 # exposure and use a fixed exposure time. Shorter exposure reduces motion blur
 # but needs more illumination. This is sensor exposure, not image brightening.
 CAMERA_EXPOSURE_US = None
+
+# Optional CH1 -> hardware H.264 -> RTSP service. Real credentials belong in
+# ignored /sdcard/wifi_video_secrets.py as WIFI_VIDEO_SSID/WIFI_VIDEO_PASSWORD.
+# With no secrets file the service stays off and the vision path is unchanged.
+WIFI_VIDEO_ENABLED = True
+# Conservative debug-video profile. It reduces IDR/RTP fragmentation peaks and
+# Python/RTSP backpressure without changing CH2 detection, control or UART.
+# After a long stable test, 512x288/30/1200-1600 may be tried again as an
+# explicit quality profile rather than the reliability default.
+WIFI_VIDEO_WIDTH = 320
+WIFI_VIDEO_HEIGHT = 240
+WIFI_VIDEO_FPS = 15
+WIFI_VIDEO_BIT_RATE_KBPS = 600
+WIFI_VIDEO_GOP_FRAMES = 15
+WIFI_VIDEO_RTSP_PORT = 8554
+WIFI_VIDEO_SESSION_NAME = "k230"
+WIFI_VIDEO_DISCOVERY_PORT = 19124
+# Discovery is best-effort and deliberately sparse. A non-blocking beacon
+# avoids a periodic pause in the same worker that drains encoded VENC packs.
+WIFI_VIDEO_BEACON_INTERVAL_MS = 10000
+WIFI_VIDEO_CONNECT_TIMEOUT_MS = 30000
+WIFI_VIDEO_STREAM_STALL_TIMEOUT_MS = 3000
+WIFI_VIDEO_OUTPUT_BUFFERS = 8
+# Reliability default: copy each encoded pack before ReleaseStream. The
+# physical-address API remains opt-in because its asynchronous buffer ownership
+# is not documented and long-run testing showed H.264 corruption with it.
+WIFI_VIDEO_PREFER_ZERO_COPY = False
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
 # Optional one-shot physical X ruler on a dedicated OSD layer. It does not
@@ -491,6 +522,46 @@ def _selected_model_config():
     return config
 
 
+def _create_wifi_video_service():
+    if not WIFI_VIDEO_ENABLED:
+        return DisabledWifiVideoService("config disabled")
+    try:
+        import wifi_video_secrets as secrets
+    except ImportError:
+        return DisabledWifiVideoService("no secrets file")
+    except Exception as exc:
+        print(
+            "wifi video secrets warning: {}: {}".format(
+                type(exc).__name__,
+                exc,
+            )
+        )
+        return DisabledWifiVideoService("secrets import error")
+
+    ssid = getattr(secrets, "WIFI_VIDEO_SSID", "")
+    password = getattr(secrets, "WIFI_VIDEO_PASSWORD", "")
+    if not ssid:
+        return DisabledWifiVideoService("SSID empty")
+    return WifiVideoService(
+        ssid=ssid,
+        password=password,
+        width=WIFI_VIDEO_WIDTH,
+        height=WIFI_VIDEO_HEIGHT,
+        source_fps=CAMERA_FPS,
+        stream_fps=WIFI_VIDEO_FPS,
+        bit_rate_kbps=WIFI_VIDEO_BIT_RATE_KBPS,
+        gop_frames=WIFI_VIDEO_GOP_FRAMES,
+        rtsp_port=WIFI_VIDEO_RTSP_PORT,
+        session_name=WIFI_VIDEO_SESSION_NAME,
+        discovery_port=WIFI_VIDEO_DISCOVERY_PORT,
+        beacon_interval_ms=WIFI_VIDEO_BEACON_INTERVAL_MS,
+        connect_timeout_ms=WIFI_VIDEO_CONNECT_TIMEOUT_MS,
+        stream_stall_timeout_ms=WIFI_VIDEO_STREAM_STALL_TIMEOUT_MS,
+        output_buffers=WIFI_VIDEO_OUTPUT_BUFFERS,
+        prefer_zero_copy=WIFI_VIDEO_PREFER_ZERO_COPY,
+    )
+
+
 def _verify_model():
     config = _selected_model_config()
     if config.get("native_roi") or config.get("native_hough"):
@@ -735,13 +806,15 @@ class CameraDisplay:
         self.sensor_running = False
         self.ruler_drawn = False
         self.exposure_us = None
+        self.wifi_video = None
         self.x_calibration_lut = get_x_calibration_lut(X_CALIBRATION_MODE)
         config = _selected_model_config()
         self.native_image_input = bool(
             config.get("native_roi") or config.get("native_hough")
         )
 
-    def start(self):
+    def start(self, wifi_video=None):
+        self.wifi_video = wifi_video
         sensor = Sensor(fps=CAMERA_FPS)
         self.sensor = sensor
         sensor.reset()
@@ -775,6 +848,8 @@ class CameraDisplay:
             else PIXEL_FORMAT_RGB_888_PLANAR,
             chn=CAM_CHN_ID_2,
         )
+        if wifi_video is not None:
+            wifi_video.prepare(sensor)
         self.osd = image.Image(
             DISPLAY_WIDTH,
             DISPLAY_HEIGHT,
@@ -796,6 +871,8 @@ class CameraDisplay:
         self.display_initialized = True
         MediaManager.init()
         self.media_initialized = True
+        if wifi_video is not None:
+            wifi_video.bind()
         sensor.run()
         self.sensor_running = True
         if SHOW_PHYSICAL_X_RULER:
@@ -978,6 +1055,7 @@ class CameraDisplay:
         capture_interval_ms,
         detector,
         tx,
+        wifi_video,
         runtime_error=None,
     ):
         osd = self.osd
@@ -1055,8 +1133,8 @@ class CameraDisplay:
             mode_color = COLOR_BAD
         self._draw_text(
             0,
-            "STEEL BALL {} {} {}".format(
-                APP_VERSION, detector.model_backend, mode
+            "STEEL BALL {} {} {} NET:{}".format(
+                APP_VERSION, detector.model_backend, mode, wifi_video.state
             ),
             mode_color,
         )
@@ -1157,11 +1235,16 @@ class CameraDisplay:
         visible_error = runtime_error
         if visible_error is None:
             visible_error = tx.last_error
-        self._draw_text(
-            8,
-            "last: " + str(visible_error)[:70],
-            COLOR_BAD if visible_error is not None else COLOR_GOOD,
-        )
+        if visible_error is not None:
+            status_text = "last: " + str(visible_error)[:70]
+            status_color = COLOR_BAD
+        else:
+            status_text = wifi_video.diagnostic_text()
+            status_color = (
+                COLOR_GOOD if wifi_video.state in ("RUN", "OFF")
+                else COLOR_WARN
+            )
+        self._draw_text(8, status_text, status_color)
         Display.show_image(osd, 0, 0, Display.LAYER_OSD3)
 
     def draw_fatal(self, stage, exc, tx):
@@ -1208,12 +1291,27 @@ class CameraDisplay:
         return True
 
     def stop(self):
+        if self.wifi_video is not None:
+            try:
+                if not self.wifi_video.stop():
+                    print(
+                        "camera cleanup skipped: wifi video worker active"
+                    )
+                    return False
+            except Exception as exc:
+                print("wifi video stop warning:", exc)
+                return False
         if self.sensor_running and self.sensor is not None:
             try:
                 self.sensor.stop()
             except Exception as exc:
                 print("sensor stop warning:", exc)
         self.sensor_running = False
+        if self.wifi_video is not None:
+            try:
+                self.wifi_video.release()
+            except Exception as exc:
+                print("wifi video release warning:", exc)
         if self.display_initialized:
             try:
                 Display.deinit()
@@ -1230,6 +1328,8 @@ class CameraDisplay:
         self.sensor = None
         self.osd = None
         self.ruler_drawn = False
+        self.wifi_video = None
+        return True
 
 
 class LatestFrameUartTx:
@@ -1442,6 +1542,7 @@ def _print_pc_debug_status(
     detector,
     camera,
     tx,
+    wifi_video,
     runtime_error,
     measured_fps,
     capture_interval_ms,
@@ -1465,7 +1566,7 @@ def _print_pc_debug_status(
         "fb[a={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
         "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
         "time[cap={},{}={},{}={},{}={},det={}]ms "
-        "UART[f={},b={},q={},e={},s={},z={},d={}] "
+        "UART[f={},b={},q={},e={},s={},z={},d={}] NET[{}] "
         "uart_last={} runtime_last={}".format(
             int(sequence),
             _tracking_mode(state, feedback),
@@ -1515,6 +1616,7 @@ def _print_pc_debug_status(
             tx.short_writes,
             tx.zero_writes,
             tx.dropped_error_frames,
+            wifi_video.diagnostic_text(),
             str(tx.last_error)[:48],
             str(runtime_error)[:48],
         )
@@ -1563,12 +1665,14 @@ def main(pc_debug=False):
     detector = None
     tracker = None
     feedback_filter = None
+    wifi_video = None
     stage = "camera_object_init"
     sequence = 0
     try:
+        wifi_video = _create_wifi_video_service()
         camera = CameraDisplay()
         stage = "camera_display_init"
-        camera.start()
+        camera.start(wifi_video=wifi_video)
         stage = "model_check"
         _verify_model()
         stage = "uart_init"
@@ -1614,12 +1718,15 @@ def main(pc_debug=False):
         )
         stage = "detector_init"
         detector = _create_detector()
+        stage = "wifi_video_start"
+        if wifi_video.state == "RDY":
+            wifi_video.start()
         print(
             "steel-ball tracker started, version={}, backend={}, model={}, "
             "expected={}, UART={} 8N1, frame={}B, software_tx={}B, "
             "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ka={:.3f}, "
             "calibration={}, ref={:+.2f}cm, center_cm_per_px={:.5f}, exposure={}, "
-            "pc_debug={}".format(
+            "net={}, pc_debug={}".format(
                 APP_VERSION,
                 detector.model_backend,
                 detector.model_path,
@@ -1635,6 +1742,7 @@ def main(pc_debug=False):
                 feedback_filter.reference_position_cm,
                 float(feedback_filter.center_cm_per_pixel),
                 camera.exposure_text(),
+                wifi_video.diagnostic_text(),
                 bool(pc_debug),
             )
         )
@@ -1798,6 +1906,7 @@ def main(pc_debug=False):
                     capture_interval_ms,
                     detector,
                     tx,
+                    wifi_video,
                     runtime_error=latched_runtime_error,
                 )
                 last_overlay_ms = now_ms
@@ -1817,6 +1926,7 @@ def main(pc_debug=False):
                     detector,
                     camera,
                     tx,
+                    wifi_video,
                     latched_runtime_error,
                     measured_fps,
                     capture_interval_ms,

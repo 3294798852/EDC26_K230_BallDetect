@@ -5,7 +5,8 @@ application.  It does not load the old task supervisor, OCR, line-following
 modules, or a command handshake. `main.py` starts the camera, one selected
 detector backend, one constrained motion filter, camera-derived
 physical-state feedback, the
-on-screen overlay, and a bounded one-way UART stream.
+on-screen overlay, a bounded one-way UART stream, and an optional isolated
+Wi-Fi H.264/RTSP service.
 
 ## SD-card layout
 
@@ -15,6 +16,8 @@ The application-specific files use this relative layout:
 main.py
 ball_calibration.py
 ball_edge_hough_detector.py
+wifi_video_service.py
+pc_rtsp_receiver.py                    # PC only; RTSP/TCP receiver
 ball_roi_detector.py
 ball_control.py
 ball_protocol.py
@@ -288,6 +291,53 @@ source/status flags. The final six payload bytes are reserved and zero. This
 application does not read MCU control data, does not use
 the legacy `HELLO`/`STATUS`/`ACK` handshake and never waits for a response. See
 `docs/MCU_UART_PROTOCOL.md` for exact offsets, scales, CRC and safety rules.
+
+## Optional Wi-Fi video
+
+Status: this branch contains an unfinished experimental implementation. It has
+connected and produced video in some tests, but current K230 runs still show
+startup failures, H.264 corruption and repeated stalls. Do not depend on it
+for control-time monitoring; keep it disabled or use the separate video
+solution until the VENC/RTSP path is investigated further.
+
+`wifi_video_service.py` uses the otherwise unused Sensor CH1 and hardware VENC0
+to publish a raw `320x240@15 FPS, 600 kb/s` H.264 stream while CH0 remains the local LCD
+source and CH2 remains the detector source. Wi-Fi connection, encoder polling,
+RTSP sending, retry and UDP discovery run in one background worker; the vision
+loop only reads bounded status counters. A stream failure therefore does not
+become a detector/control/UART failure.
+
+Credentials are loaded only from ignored `/sdcard/wifi_video_secrets.py`.
+Without that file the feature remains `NET OFF` and does not configure CH1 or
+VENC. The RTSP frame deliberately contains the raw camera view rather than the
+Python OSD/detection box, avoiding a per-frame image copy and drawing pass.
+Configuration, lifecycle, diagnostics, API evidence, receiver URL and required
+K230 performance/weak-network tests are documented in
+`docs/WIFI_VIDEO_SERVICE.md`.
+
+The maintained PC receiver forces RTSP over TCP, applies bounded OpenCV open/
+read timeouts when supported and reconnects automatically:
+
+```text
+python -m pip install opencv-python
+python pc_rtsp_receiver.py
+```
+
+Run it with desktop CPython, not CanMV. The K230 now copies each encoded VENC
+pack before releasing the hardware buffer. This is the reliability default;
+the physical-address zero-copy mode remains an opt-in experiment. Copying
+removes one unsafe buffer-lifetime risk, but it is not claimed to be the sole
+cause of decoder errors. The conservative default also lowers frame size,
+frame rate and IDR peak load and uses all eight supported VENC output buffers.
+
+If `cv2.namedWindow` reports that the function is not implemented, a headless
+or conflicting OpenCV wheel is being imported. Use the same `python` command
+that runs the receiver to remove headless variants and reinstall the GUI wheel:
+
+```text
+python -m pip uninstall -y opencv-python-headless opencv-contrib-python-headless
+python -m pip install --upgrade --force-reinstall opencv-python
+```
 
 ## Direct PC UART test and K230-side debug
 

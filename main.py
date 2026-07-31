@@ -18,6 +18,7 @@ nn = None
 np = None
 FPIOA = None
 UART = None
+TOUCH = None
 Display = None
 MediaManager = None
 Sensor = None
@@ -53,6 +54,7 @@ BALL_REFERENCE_FLAG_SOURCE_PRESET = 0x0002
 
 _BOOT_IMPORT_ERROR = None
 _BOOT_IMPORT_STAGE = None
+_TOUCH_IMPORT_ERROR = None
 try:
     _BOOT_IMPORT_STAGE = "import_aidemo"
     import aidemo
@@ -64,6 +66,10 @@ try:
     import ulab.numpy as np
     _BOOT_IMPORT_STAGE = "import_machine_uart"
     from machine import FPIOA, UART
+    try:
+        from machine import TOUCH
+    except Exception as _touch_import_exc:
+        _TOUCH_IMPORT_ERROR = _touch_import_exc
     _BOOT_IMPORT_STAGE = "import_media_display"
     from media.display import Display
     _BOOT_IMPORT_STAGE = "import_media_manager"
@@ -118,7 +124,7 @@ except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.38"
+APP_VERSION = "proj2-1.53"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -202,14 +208,29 @@ PIPE_POSITIVE_END_Y_PX = 160.0
 # is the current physical-ruler fit; "pinhole" preserves the original model.
 X_CALIBRATION_MODE = X_CALIBRATION_MEASURED
 
-# K230 publishes only its camera-derived state-feedback term. Physical position
-# and velocity pass through continuous soft deadbands before their gains.
+# K230 publishes a continuous camera-derived PI-D term. The control equation
+# never switches on tracker motion labels. Small soft deadbands are applied to
+# position and velocity independently, so dynamic feedback is zero only when
+# both values are small.
 FEEDBACK_KP = 8.0
-FEEDBACK_KD = 7.5
+FEEDBACK_KD = 12.0
+FEEDBACK_KI = 12.0
 FEEDBACK_KA = 0.0
 FEEDBACK_ACCEL_LIMIT_CM_S2 = 140.0
-FEEDBACK_POSITION_DEADBAND_CM = 0.12
-FEEDBACK_VELOCITY_DEADBAND_CM_S = 0.40
+FEEDBACK_POSITION_DEADBAND_CM = 0.10
+FEEDBACK_VELOCITY_DEADBAND_CM_S = 0.35
+FEEDBACK_POSITION_FILTER_TAU_S = 0.025
+FEEDBACK_VELOCITY_FILTER_TAU_S = 0.050
+FEEDBACK_OUTPUT_FILTER_TAU_S = 0.025
+FEEDBACK_INTEGRAL_LIMIT_CM_S2 = 80.0
+FEEDBACK_INTEGRAL_ERROR_LIMIT_CM = 1.0
+# Continuous static-friction compensation. It ramps linearly from zero over
+# the first 0.20 cm beyond the position soft deadband, then stays at 20 cm/s2.
+# Measure the real breakaway threshold and keep this at roughly 70--85% of it.
+FEEDBACK_INTEGRAL_LEAK_PER_S = 0.0
+FEEDBACK_INTEGRAL_UNWIND_GAIN_S2 = 20.0
+FEEDBACK_BREAKAWAY_ACCEL_CM_S2 = 20.0
+FEEDBACK_BREAKAWAY_TRANSITION_CM = 0.20
 # Absolute calibrated X coordinate used as the ball equilibrium origin.
 # A future validated algorithm/MCU command may call
 # BallStateFeedback.set_reference_position_cm() to update it at runtime.
@@ -245,8 +266,6 @@ TRACK_QUIET_GATE_MIN_PX = 10.0
 TRACK_MOTION_MIN_QUALITY = 0.62
 TRACK_MOTION_MIN_SUPPORT = 2
 TRACK_ASSOCIATION_AMBIGUITY_DIAMETER_FACTOR = 0.75
-FEEDBACK_QUIET_ALPHA = 0.35
-FEEDBACK_QUIET_HYSTERESIS_CM_S2 = 0.0
 
 CAMERA_FPS = 60
 # Leave as None to preserve the camera firmware's original exposure behavior.
@@ -317,6 +336,28 @@ COLOR_RULER_MAJOR = (255, 0, 255, 255)
 COLOR_RULER_SHADOW = (180, 0, 0, 0)
 STATUS_PANEL_HEIGHT = 230
 
+# Optional live PID tuning panel. TOUCH(0).read(1) is polled once per frame;
+# each press edge changes one gain once, so holding a button cannot run away.
+# Changes are intentionally RAM-only and revert to the defaults above at boot.
+TOUCH_PID_ENABLED = True
+TOUCH_PID_STEP_KP = 0.1
+TOUCH_PID_STEP_KD = 0.1
+TOUCH_PID_STEP_KI = 0.1
+TOUCH_PID_KP_RANGE = (0.0, 30.0)
+# Schema-6 encodes Kd as u8/10, so 25.5 is the largest exactly reportable
+# value. Keeping the runtime bound aligned avoids MCU diagnostic mismatch.
+TOUCH_PID_KD_RANGE = (0.0, 25.5)
+TOUCH_PID_KI_RANGE = (0.0, 30.0)
+TOUCH_PID_DEBOUNCE_MS = 120
+TOUCH_PID_RETRY_MS = 2000
+TOUCH_PID_PANEL_TOP = 350
+TOUCH_PID_ROW_HEIGHT = 42
+TOUCH_PID_MINUS_X = 430
+TOUCH_PID_PLUS_X = 540
+TOUCH_PID_BUTTON_WIDTH = 82
+TOUCH_PID_BUTTON_HEIGHT = 34
+COLOR_TOUCH_BUTTON = (210, 24, 24, 24)
+
 
 def _ticks_ms():
     if hasattr(time, "ticks_ms"):
@@ -361,6 +402,127 @@ def _is_ide_interrupt(exc):
         return "ide interrupt" in str(exc).strip().lower()
     except Exception:
         return False
+
+
+class TouchPidTuner:
+    """Non-blocking TOUCH(0) press-edge gain adjustment."""
+
+    def __init__(self, controller):
+        self.controller = controller
+        self.touch = None
+        self.enabled = bool(TOUCH_PID_ENABLED)
+        self.state = "OFF" if not self.enabled else "INIT"
+        self.last_press_ms = None
+        self.retry_after_ms = 0
+        self.error_count = 0
+        self.change_count = 0
+        self.last_error = None
+        self.last_action = ""
+        if self.enabled:
+            self._try_init(_ticks_ms())
+
+    def _set_error(self, stage, exc, now_ms):
+        self.touch = None
+        self.state = "ERR"
+        self.error_count += 1
+        self.retry_after_ms = int(now_ms) + int(TOUCH_PID_RETRY_MS)
+        self.last_error = "touch #{} {} {}: {}".format(
+            self.error_count,
+            stage,
+            type(exc).__name__,
+            exc,
+        )
+        print(self.last_error)
+
+    def _try_init(self, now_ms):
+        if TOUCH is None:
+            exc = _TOUCH_IMPORT_ERROR
+            if exc is None:
+                exc = RuntimeError("machine.TOUCH unavailable")
+            self._set_error("init", exc, now_ms)
+            return
+        try:
+            self.touch = TOUCH(0)
+            self.state = "RUN"
+            self.last_error = None
+        except Exception as exc:
+            self._set_error("init", exc, now_ms)
+
+    @staticmethod
+    def _inside(value, start, length):
+        return int(start) <= int(value) < int(start) + int(length)
+
+    def _adjust(self, name, delta):
+        if name == "kp":
+            low, high = TOUCH_PID_KP_RANGE
+            value = max(low, min(high, self.controller.kp + delta))
+            self.controller.set_gains(kp=value)
+        elif name == "kd":
+            low, high = TOUCH_PID_KD_RANGE
+            value = max(low, min(high, self.controller.kd + delta))
+            self.controller.set_gains(kd=value)
+        else:
+            low, high = TOUCH_PID_KI_RANGE
+            value = max(low, min(high, self.controller.ki + delta))
+            self.controller.set_gains(ki=value)
+        self.change_count += 1
+        self.last_action = "{}={:.1f}".format(name.upper(), value)
+        print("touch PID {} changes={}".format(
+            self.last_action,
+            self.change_count,
+        ))
+
+    def _handle_press(self, x, y):
+        if not self._inside(y, TOUCH_PID_PANEL_TOP, 3 * TOUCH_PID_ROW_HEIGHT):
+            return
+        row = (int(y) - TOUCH_PID_PANEL_TOP) // TOUCH_PID_ROW_HEIGHT
+        if row == 0:
+            name = "kp"
+            step = TOUCH_PID_STEP_KP
+        elif row == 1:
+            name = "kd"
+            step = TOUCH_PID_STEP_KD
+        else:
+            name = "ki"
+            step = TOUCH_PID_STEP_KI
+        if self._inside(x, TOUCH_PID_MINUS_X, TOUCH_PID_BUTTON_WIDTH):
+            self._adjust(name, -float(step))
+        elif self._inside(x, TOUCH_PID_PLUS_X, TOUCH_PID_BUTTON_WIDTH):
+            self._adjust(name, float(step))
+
+    def poll(self, now_ms):
+        """Poll once; all failures are retained for LCD/PC diagnostics."""
+        if not self.enabled:
+            return
+        now_ms = int(now_ms)
+        if self.touch is None:
+            if _ticks_diff(now_ms, self.retry_after_ms) >= 0:
+                self._try_init(now_ms)
+            return
+        try:
+            points = self.touch.read(1)
+            if points is not None and len(points):
+                point = points[0]
+                event = int(point.event)
+                event_down = getattr(TOUCH, "EVENT_DOWN", 2)
+                debounce_ready = bool(
+                    self.last_press_ms is None
+                    or _ticks_diff(now_ms, self.last_press_ms)
+                    >= TOUCH_PID_DEBOUNCE_MS
+                )
+                if event == event_down and debounce_ready:
+                    self._handle_press(int(point.x), int(point.y))
+                    self.last_press_ms = now_ms
+        except Exception as exc:
+            self._set_error("read", exc, now_ms)
+
+    def diagnostic_text(self):
+        text = "{} n={}".format(self.state, self.change_count)
+        if self.last_action:
+            text += " " + self.last_action
+        if self.last_error is not None:
+            text += " " + str(self.last_error)[:44]
+        return text
 
 
 def _fatal_hold_loop(tx=None):
@@ -1080,6 +1242,89 @@ class CameraDisplay:
             color=color,
         )
 
+    def _draw_pid_panel(self, pid_tuner, feedback):
+        if pid_tuner is None or not pid_tuner.enabled:
+            return
+        osd = self.osd
+        panel_top = TOUCH_PID_PANEL_TOP - 20
+        osd.draw_rectangle(
+            0,
+            panel_top,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT - panel_top,
+            color=COLOR_PANEL,
+            fill=True,
+        )
+        osd.draw_string_advanced(
+            8,
+            panel_top + 1,
+            16,
+            "PID TOUCH step=0.1 {}".format(pid_tuner.diagnostic_text()),
+            color=(COLOR_BAD if pid_tuner.last_error is not None else COLOR_TITLE),
+        )
+        values = (
+            ("Kp", float(feedback.get("kp", pid_tuner.controller.kp))),
+            ("Kd", float(feedback.get("kd", pid_tuner.controller.kd))),
+            ("Ki", float(feedback.get("ki", pid_tuner.controller.ki))),
+        )
+        for row, item in enumerate(values):
+            label, value = item
+            top = TOUCH_PID_PANEL_TOP + row * TOUCH_PID_ROW_HEIGHT
+            button_y = top + 3
+            osd.draw_string_advanced(
+                16,
+                top + 8,
+                20,
+                "{}={:4.1f}".format(label, value),
+                color=COLOR_TITLE,
+            )
+            osd.draw_rectangle(
+                TOUCH_PID_MINUS_X,
+                button_y,
+                TOUCH_PID_BUTTON_WIDTH,
+                TOUCH_PID_BUTTON_HEIGHT,
+                color=COLOR_TOUCH_BUTTON,
+                fill=True,
+            )
+            osd.draw_rectangle(
+                TOUCH_PID_MINUS_X,
+                button_y,
+                TOUCH_PID_BUTTON_WIDTH,
+                TOUCH_PID_BUTTON_HEIGHT,
+                color=COLOR_TITLE,
+                thickness=2,
+            )
+            osd.draw_string_advanced(
+                TOUCH_PID_MINUS_X + 33,
+                top + 5,
+                24,
+                "-",
+                color=COLOR_TITLE,
+            )
+            osd.draw_rectangle(
+                TOUCH_PID_PLUS_X,
+                button_y,
+                TOUCH_PID_BUTTON_WIDTH,
+                TOUCH_PID_BUTTON_HEIGHT,
+                color=COLOR_TOUCH_BUTTON,
+                fill=True,
+            )
+            osd.draw_rectangle(
+                TOUCH_PID_PLUS_X,
+                button_y,
+                TOUCH_PID_BUTTON_WIDTH,
+                TOUCH_PID_BUTTON_HEIGHT,
+                color=COLOR_TITLE,
+                thickness=2,
+            )
+            osd.draw_string_advanced(
+                TOUCH_PID_PLUS_X + 31,
+                top + 5,
+                24,
+                "+",
+                color=COLOR_TITLE,
+            )
+
     def draw_status(
         self,
         candidate,
@@ -1093,6 +1338,7 @@ class CameraDisplay:
         detector,
         tx,
         wifi_video,
+        pid_tuner=None,
         runtime_error=None,
     ):
         osd = self.osd
@@ -1202,17 +1448,17 @@ class CameraDisplay:
         )
         self._draw_text(
             3,
-            "FB={:+.1f}/{:+.1f} kp={:.1f} kd={:.1f} ka={:.2f} {} sat={}".format(
+            "FB{:+.1f}/{:+.1f} I{:+.1f} F{:+.1f} s={} db={}{}".format(
                 float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
                 float(feedback.get(
                     "unfiltered_feedback_acceleration_cm_s2",
                     0.0,
                 )),
-                float(feedback.get("kp", 0.0)),
-                float(feedback.get("kd", 0.0)),
-                float(feedback.get("ka", 0.0)),
-                "VALID" if feedback.get("feedback_valid") else "INVALID",
-                "Y" if feedback.get("feedback_saturated") else "N",
+                float(feedback.get("steady_correction_cm_s2", 0.0)),
+                float(feedback.get("breakaway_feedback_cm_s2", 0.0)),
+                str(feedback.get("steady_correction_state", "?"))[:6],
+                "Y" if feedback.get("joint_deadband_active") else "N",
+                " SAT" if feedback.get("feedback_saturated") else "",
             ),
             COLOR_GOOD if feedback.get("feedback_valid") else COLOR_WARN,
         )
@@ -1239,7 +1485,7 @@ class CameraDisplay:
         )
         self._draw_text(
             5,
-            "{} M{}{}{}{}{} d{:+.1f} I{:+.1f} R{} A{}/{}".format(
+            "{} M{}{}{}{}{} d{:+.1f} vm{:+.1f} R{} A{}/{}".format(
                 _detector_diagnostic_text(detector, candidate),
                 str(state.get("motion_state", "?"))[:1],
                 int(state.get("motion_confirm_count", 0)),
@@ -1247,7 +1493,7 @@ class CameraDisplay:
                 "W" if state.get("association_wide") else "",
                 "C" if state.get("association_competing") else "",
                 float(state.get("motion_step_px", 0.0)),
-                float(state.get("axial_innovation", 0.0)),
+                float(state.get("measured_axial_velocity", 0.0)),
                 int(state.get("association_reject_count", 0)),
                 int(state.get("acquisition_count", 0)),
                 int(state.get("acquisition_required", 3)),
@@ -1281,6 +1527,12 @@ class CameraDisplay:
         visible_error = runtime_error
         if visible_error is None:
             visible_error = tx.last_error
+        if (
+            visible_error is None
+            and pid_tuner is not None
+            and pid_tuner.last_error is not None
+        ):
+            visible_error = pid_tuner.last_error
         if visible_error is not None:
             status_text = "last: " + str(visible_error)[:70]
             status_color = COLOR_BAD
@@ -1291,6 +1543,7 @@ class CameraDisplay:
                 else COLOR_WARN
             )
         self._draw_text(8, status_text, status_color)
+        self._draw_pid_panel(pid_tuner, feedback)
         Display.show_image(osd, 0, 0, Display.LAYER_OSD3)
 
     def draw_fatal(self, stage, exc, tx):
@@ -1589,6 +1842,7 @@ def _print_pc_debug_status(
     camera,
     tx,
     wifi_video,
+    pid_tuner,
     runtime_error,
     measured_fps,
     capture_interval_ms,
@@ -1606,14 +1860,16 @@ def _print_pc_debug_status(
     print(
         "PCDBG seq={} mode={} flags=0x{:02X} raw=({:.1f},{:.1f}) "
         "filt=({:.2f},{:.2f}) vel=({:.1f},{:.1f}) conf={:.3f} "
-        "obs[m={}{}{}{}{},st={:+.1f},f={},in={:+.2f},vm={:+.1f},"
+        "obs[m={}{}{}{}{},step={:+.1f},fast={},in={:+.2f},vm={:+.1f},"
         "q={:.2f},s={}] "
         "phys[p=({:+.2f},{:+.2f}),v=({:+.2f},{:+.2f}),aX={:+.1f},"
         "ref={:+.2f},e={:+.2f}] "
-        "fb[a={:+.1f},raw={:+.1f},kp={:.2f},kd={:.2f},ka={:.3f},valid={},sat={}] "
+        "ctrl[e={:+.2f},v={:+.2f},db={}] "
+        "fb[a={:+.1f},raw={:+.1f},kp={:.2f},kd={:.2f},ki={:.2f},"
+        "ka={:.3f},I={:+.2f},F={:+.2f},is={},valid={},sat={}] "
         "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
         "time[cap={},{}={},{}={},{}={},det={}]ms "
-        "UART[f={},b={},q={},e={},s={},z={},d={}] NET[{}] "
+        "UART[f={},b={},q={},e={},s={},z={},d={}] NET[{}] TOUCH[{}] "
         "uart_last={} runtime_last={}".format(
             int(sequence),
             _tracking_mode(state, feedback),
@@ -1643,6 +1899,9 @@ def _print_pc_debug_status(
             float(feedback.get("acceleration_cm_s2", 0.0)),
             float(feedback.get("reference_position_cm", 0.0)),
             float(feedback.get("position_error_cm", 0.0)),
+            float(feedback.get("control_position_error_cm", 0.0)),
+            float(feedback.get("feedback_velocity_cm_s", 0.0)),
+            "Y" if feedback.get("joint_deadband_active") else "N",
             float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
             float(feedback.get(
                 "unfiltered_feedback_acceleration_cm_s2",
@@ -1650,7 +1909,11 @@ def _print_pc_debug_status(
             )),
             float(feedback.get("kp", 0.0)),
             float(feedback.get("kd", 0.0)),
+            float(feedback.get("ki", 0.0)),
             float(feedback.get("ka", 0.0)),
+            float(feedback.get("steady_correction_cm_s2", 0.0)),
+            float(feedback.get("breakaway_feedback_cm_s2", 0.0)),
+            str(feedback.get("steady_correction_state", "?")),
             "Y" if feedback.get("feedback_valid") else "N",
             "Y" if feedback.get("feedback_saturated") else "N",
             detector.model_backend,
@@ -1676,6 +1939,7 @@ def _print_pc_debug_status(
             tx.zero_writes,
             tx.dropped_error_frames,
             wifi_video.diagnostic_text(),
+            "OFF" if pid_tuner is None else pid_tuner.diagnostic_text(),
             str(tx.last_error)[:48],
             str(runtime_error)[:48],
         )
@@ -1724,6 +1988,7 @@ def main(pc_debug=False):
     detector = None
     tracker = None
     feedback_filter = None
+    pid_tuner = None
     wifi_video = None
     stage = "camera_object_init"
     sequence = 0
@@ -1783,6 +2048,7 @@ def main(pc_debug=False):
         feedback_filter = BallStateFeedback(
             kp=FEEDBACK_KP,
             kd=FEEDBACK_KD,
+            ki=FEEDBACK_KI,
             ka=FEEDBACK_KA,
             max_feedback_accel_cm_s2=FEEDBACK_ACCEL_LIMIT_CM_S2,
             position_deadband_cm=FEEDBACK_POSITION_DEADBAND_CM,
@@ -1797,11 +2063,18 @@ def main(pc_debug=False):
                 BALL_REFERENCE_FLAG_VALID
                 | BALL_REFERENCE_FLAG_SOURCE_PRESET
             ),
-            quiet_feedback_alpha=FEEDBACK_QUIET_ALPHA,
-            quiet_feedback_hysteresis_cm_s2=(
-                FEEDBACK_QUIET_HYSTERESIS_CM_S2
-            ),
+            position_filter_tau_s=FEEDBACK_POSITION_FILTER_TAU_S,
+            velocity_filter_tau_s=FEEDBACK_VELOCITY_FILTER_TAU_S,
+            feedback_filter_tau_s=FEEDBACK_OUTPUT_FILTER_TAU_S,
+            integral_limit_cm_s2=FEEDBACK_INTEGRAL_LIMIT_CM_S2,
+            integral_error_limit_cm=FEEDBACK_INTEGRAL_ERROR_LIMIT_CM,
+            integral_leak_per_s=FEEDBACK_INTEGRAL_LEAK_PER_S,
+            integral_unwind_gain_s2=FEEDBACK_INTEGRAL_UNWIND_GAIN_S2,
+            breakaway_accel_cm_s2=FEEDBACK_BREAKAWAY_ACCEL_CM_S2,
+            breakaway_transition_cm=FEEDBACK_BREAKAWAY_TRANSITION_CM,
         )
+        stage = "touch_pid_init"
+        pid_tuner = TouchPidTuner(feedback_filter)
         stage = "detector_init"
         detector = _create_detector()
         stage = "wifi_video_start"
@@ -1810,7 +2083,10 @@ def main(pc_debug=False):
         print(
             "steel-ball tracker started, version={}, backend={}, model={}, "
             "expected={}, UART={} 8N1, frame={}B, software_tx={}B, "
-            "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ka={:.3f}, "
+            "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ki={:.2f}, "
+            "fb_ka={:.3f}, fb_i_limit={:.1f}, fb_unwind={:.1f}, "
+            "fb_break={:.1f}/{:.2f}, "
+            "fb_db={:.2f}/{:.2f}, "
             "calibration={}, ref={:+.2f}cm, center_cm_per_px={:.5f}, exposure={}, "
             "net={}, pc_debug={}".format(
                 APP_VERSION,
@@ -1823,7 +2099,14 @@ def main(pc_debug=False):
                 detector.pipeline_name,
                 float(feedback_filter.kp),
                 float(feedback_filter.kd),
+                float(feedback_filter.ki),
                 float(feedback_filter.ka),
+                float(feedback_filter.integral_limit_cm_s2),
+                float(feedback_filter.integral_unwind_gain_s2),
+                float(feedback_filter.breakaway_accel_cm_s2),
+                float(feedback_filter.breakaway_transition_cm),
+                float(feedback_filter.position_deadband_cm),
+                float(feedback_filter.velocity_deadband_cm_s),
                 feedback_filter.x_calibration_mode,
                 feedback_filter.reference_position_cm,
                 float(feedback_filter.center_cm_per_pixel),
@@ -1846,6 +2129,8 @@ def main(pc_debug=False):
         while True:
             _exitpoint()
             tx.poll()
+            stage = "touch_pid_poll"
+            pid_tuner.poll(_ticks_ms())
             candidate = None
             detections = []
             feedback = None
@@ -1993,6 +2278,7 @@ def main(pc_debug=False):
                     detector,
                     tx,
                     wifi_video,
+                    pid_tuner=pid_tuner,
                     runtime_error=latched_runtime_error,
                 )
                 last_overlay_ms = now_ms
@@ -2013,6 +2299,7 @@ def main(pc_debug=False):
                     camera,
                     tx,
                     wifi_video,
+                    pid_tuner,
                     latched_runtime_error,
                     measured_fps,
                     capture_interval_ms,

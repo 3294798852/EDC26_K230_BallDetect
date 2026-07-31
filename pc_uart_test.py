@@ -742,6 +742,7 @@ def _run_pc_debug_format_self_test():
             tx,
             wifi_video,
             None,
+            None,
             30.0,
             33.3,
         )
@@ -825,183 +826,119 @@ def run_self_test():
 
     from ball_control import BallStateFeedback
 
-    default_controller = BallStateFeedback(
-        x_calibration_mode=X_CALIBRATION_MEASURED,
+    controller = BallStateFeedback(x_calibration_mode=X_CALIBRATION_MEASURED)
+    assert (controller.kp, controller.kd, controller.ki, controller.ka) == (
+        8.0, 12.0, 12.0, 0.0
     )
-    assert default_controller.kp == 8.0
-    assert default_controller.kd == 7.5
-    assert default_controller.ka == 0.0
-    assert default_controller.max_feedback_accel_cm_s2 == 140.0
-    assert default_controller.position_deadband_cm == 0.12
-    assert default_controller.velocity_deadband_cm_s == 0.40
-    assert default_controller.quiet_feedback_alpha == 0.35
-    assert default_controller.quiet_feedback_hysteresis_cm_s2 == 0.0
-
-    reference_controller = BallStateFeedback(
-        kp=2.0,
-        kd=3.0,
-        ka=0.0,
-        position_deadband_cm=0.0,
-        velocity_deadband_cm_s=0.0,
-        x_calibration_mode=X_CALIBRATION_MEASURED,
-        reference_position_cm=3.0,
+    assert controller.position_deadband_cm == 0.10
+    assert controller.velocity_deadband_cm_s == 0.35
+    assert controller.integral_limit_cm_s2 == 80.0
+    assert controller.integral_leak_per_s == 0.0
+    assert controller.integral_unwind_gain_s2 == 20.0
+    assert controller.breakaway_accel_cm_s2 == 20.0
+    assert controller.breakaway_transition_cm == 0.20
+    assert controller.set_gains(kp=8.1, kd=12.1, ki=12.1)[:3] == (
+        8.1, 12.1, 12.1
     )
-    reference_pixel = x_pixel_for_position_cm(5.8, measured_lut)
-    reference_state = {
-        "x": reference_pixel,
-        "y": 160.0,
-        "vx": 10.0,
-        "vy": 0.0,
-        "track_valid": True,
-        "measurement_accepted": True,
-        "predicted": False,
-        "missed_frames": 0,
-        "measurement_age_ms": 0,
-    }
-    reference_candidate = {"edge_clipped": False}
-    reference_feedback = reference_controller.update(
-        reference_state,
-        reference_candidate,
-        1000,
-    )
-    expected_feedback = -(
-        2.0 * (reference_feedback["position_cm"] - 3.0)
-        + 3.0 * reference_feedback["velocity_cm_s"]
-    )
-    assert abs(reference_feedback["position_cm"] - 5.8) < 0.0001
-    assert abs(reference_feedback["position_error_cm"] - 2.8) < 0.0001
-    assert abs(
-        reference_feedback["feedback_acceleration_cm_s2"]
-        - expected_feedback
-    ) < 0.0001
-    assert reference_controller.set_reference_position_cm(-2.5) == -2.5
     try:
-        reference_controller.set_reference_position_cm(12.6)
-        raise AssertionError("out-of-range reference must fail")
+        controller.set_gains(kp=-0.1)
+        raise AssertionError("negative gain must fail")
     except ValueError:
         pass
 
-    control_pixel = x_pixel_for_position_cm(1.0, measured_lut)
-    control_scale = x_position_and_scale(
-        control_pixel,
-        measured_lut,
-    )[1]
-    control_state = {
-        "x": control_pixel,
+    reference_candidate = {"edge_clipped": False}
+    settled_state = {
+        "x": x_pixel_for_position_cm(0.05, measured_lut),
         "y": 160.0,
-        "vx": 2.0 / control_scale,
+        "vx": 0.1 / x_center_scale(measured_lut),
         "vy": 0.0,
         "track_valid": True,
         "measurement_accepted": True,
         "predicted": False,
         "missed_frames": 0,
         "measurement_age_ms": 0,
+        "motion_state": "QUIET",
     }
-    motion_feedback = {}
-    for motion_state in ("MOVING", "PENDING", "QUIET"):
-        state_for_mode = dict(control_state)
-        state_for_mode["motion_state"] = motion_state
-        controller_for_mode = BallStateFeedback(
-            x_calibration_mode=X_CALIBRATION_MEASURED,
-        )
-        motion_feedback[motion_state] = controller_for_mode.update(
-            state_for_mode,
-            reference_candidate,
-            1800,
-        )
-    expected_position_term = 8.0 * (1.0 - 0.12)
-    expected_velocity_term = 7.5 * (2.0 - 0.40)
-    for motion_state in ("MOVING", "PENDING"):
-        assert abs(
-            motion_feedback[motion_state][
-                "unfiltered_feedback_acceleration_cm_s2"
-            ]
-            + expected_position_term
-            + expected_velocity_term
-        ) < 0.001
-    assert abs(
-        motion_feedback["QUIET"][
-            "unfiltered_feedback_acceleration_cm_s2"
-        ]
-        + expected_position_term
-    ) < 0.001
+    settled_feedback = controller.update(
+        settled_state, reference_candidate, 1000
+    )
+    assert settled_feedback["joint_deadband_active"]
+    assert settled_feedback["feedback_acceleration_cm_s2"] == 0.0
 
-    quiet_controller = BallStateFeedback(
-        kp=8.0,
-        kd=7.5,
+    active_state = dict(settled_state)
+    active_state["x"] = x_pixel_for_position_cm(1.0, measured_lut)
+    active_feedback = controller.update(active_state, reference_candidate, 1033)
+    assert not active_feedback["joint_deadband_active"]
+    assert active_feedback["feedback_acceleration_cm_s2"] < 0.0
+
+    breakaway_controller = BallStateFeedback(
+        kp=0.0,
+        kd=0.0,
+        ki=0.0,
+        ka=0.0,
+        position_deadband_cm=0.10,
+        velocity_deadband_cm_s=0.0,
+        position_filter_tau_s=0.0,
+        velocity_filter_tau_s=0.0,
+        feedback_filter_tau_s=0.0,
+        breakaway_accel_cm_s2=20.0,
+        breakaway_transition_cm=0.20,
+        x_calibration_mode=X_CALIBRATION_MEASURED,
+    )
+    breakaway_state = dict(settled_state)
+    breakaway_state["vx"] = 0.0
+    breakaway_state["x"] = x_pixel_for_position_cm(0.20, measured_lut)
+    breakaway_feedback = breakaway_controller.update(
+        breakaway_state,
+        reference_candidate,
+        2000,
+    )
+    assert abs(breakaway_feedback["breakaway_feedback_cm_s2"] + 10.0) < 0.01
+    assert abs(breakaway_feedback["feedback_acceleration_cm_s2"] + 10.0) < 0.01
+    breakaway_state["x"] = x_pixel_for_position_cm(-0.50, measured_lut)
+    breakaway_feedback = breakaway_controller.update(
+        breakaway_state,
+        reference_candidate,
+        2033,
+    )
+    assert abs(breakaway_feedback["breakaway_feedback_cm_s2"] - 20.0) < 0.01
+
+    unwind_controller = BallStateFeedback(
+        kp=0.0,
+        kd=0.0,
+        ki=12.0,
         ka=0.0,
         position_deadband_cm=0.0,
         velocity_deadband_cm_s=0.0,
+        position_filter_tau_s=0.0,
+        velocity_filter_tau_s=0.0,
+        feedback_filter_tau_s=0.0,
+        integral_unwind_gain_s2=20.0,
+        breakaway_accel_cm_s2=0.0,
         x_calibration_mode=X_CALIBRATION_MEASURED,
     )
-    quiet_outputs = []
-    quiet_raw_outputs = []
-    for index in range(20):
-        position_cm = 0.8 if index % 2 == 0 else -0.8
-        quiet_state = {
-            "x": x_pixel_for_position_cm(position_cm, measured_lut),
-            "y": 160.0,
-            "vx": 200.0 if index % 2 == 0 else -200.0,
-            "vy": 0.0,
-            "track_valid": True,
-            "measurement_accepted": True,
-            "predicted": False,
-            "missed_frames": 0,
-            "measurement_age_ms": 0,
-            "motion_state": "QUIET",
-        }
-        quiet_feedback = quiet_controller.update(
-            quiet_state,
-            reference_candidate,
-            2000 + index * 33,
-        )
-        expected_position_only = -8.0 * position_cm
-        assert abs(
-            quiet_feedback["unfiltered_feedback_acceleration_cm_s2"]
-            - expected_position_only
-        ) < 0.0002
-        quiet_outputs.append(
-            quiet_feedback["feedback_acceleration_cm_s2"]
-        )
-        quiet_raw_outputs.append(
-            quiet_feedback["unfiltered_feedback_acceleration_cm_s2"]
-        )
-    assert (
-        max(quiet_outputs[-8:]) - min(quiet_outputs[-8:])
-        < 0.35 * (
-            max(quiet_raw_outputs[-8:]) - min(quiet_raw_outputs[-8:])
-        )
-    )
-    reset_state = dict(quiet_state)
-    reset_state["x"] = x_pixel_for_position_cm(1.25, measured_lut)
-    reset_state["filter_reset"] = True
-    reset_feedback = quiet_controller.update(
-        reset_state,
+    unwind_controller.integral_correction_cm_s2 = -40.0
+    unwind_state = dict(settled_state)
+    unwind_state["x"] = x_pixel_for_position_cm(2.0, measured_lut)
+    unwind_scale = x_position_and_scale(
+        unwind_state["x"], measured_lut
+    )[1]
+    unwind_state["vx"] = -5.0 / unwind_scale
+    unwind_feedback = unwind_controller.update(
+        unwind_state,
         reference_candidate,
-        2700,
+        3000,
     )
-    assert abs(
-        reset_feedback["feedback_acceleration_cm_s2"]
-        - reset_feedback["unfiltered_feedback_acceleration_cm_s2"]
-    ) < 0.0001
-    previous_magnitude = abs(
-        reset_feedback["feedback_acceleration_cm_s2"]
+    assert abs(unwind_feedback["steady_correction_cm_s2"] + 36.5) < 0.01
+    assert unwind_feedback["steady_correction_unwind_active"]
+    assert unwind_feedback["steady_correction_state"] == "UNWIND"
+    unwind_controller.integral_correction_cm_s2 = -0.5
+    unwind_feedback = unwind_controller.update(
+        unwind_state,
+        reference_candidate,
+        3033,
     )
-    zero_state = dict(reset_state)
-    zero_state["x"] = x_pixel_for_position_cm(0.0, measured_lut)
-    zero_state["filter_reset"] = False
-    for index in range(20):
-        zero_feedback = quiet_controller.update(
-            zero_state,
-            reference_candidate,
-            2733 + index * 33,
-        )
-        current_magnitude = abs(
-            zero_feedback["feedback_acceleration_cm_s2"]
-        )
-        assert current_magnitude < previous_magnitude
-        previous_magnitude = current_magnitude
-    assert previous_magnitude < 0.01
+    assert unwind_feedback["steady_correction_cm_s2"] == 0.0
 
     candidate = {
         "confidence": 0.92,

@@ -81,32 +81,42 @@ The raw feedback target is
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
+e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
+e_db = Db(e_f, 0.10)
+Ufric = -20 * clamp(e_db / 0.20, -1, +1)
+if e_f*v_db < 0 and I != 0:
+    I = move_toward_zero(I, 20*abs(v_db)*dt)
+else:
+    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
+a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
+a_fb = clamp(LPF(a_raw, 25 ms), +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
-Default gains are `Kp=8.0`, `Kd=7.5`, `Ka=0`, and `a_fb` is limited to
-`+/-140 cm/s2`. Tracker-internal `PENDING` and `MOVING` states both retain the
-velocity used by `Kd`; only `QUIET` sets the control velocity to zero. Motion
-starts after at least two reliable same-direction measurements; uncertain Hough
-measurements require three, and no single quiet-state jump creates velocity.
-Motion must then show four consecutive axial center steps no larger than
-`0.75 px` before returning to `QUIET`. Confirmed `MOVING` uses the raw target immediately. Sustained
-non-moving output follows it with gain `0.35` and zero hysteresis, allowing the
-feedback to converge fully to zero. This internal motion state and the raw
-pre-stabilization target are screen/PC diagnostics and are not additional
-schema-6 fields.
+Default gains are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. `I` is bounded to
+`+/-80 cm/s2`, has no default leakage, uses conditional anti-windup, holds on
+predicted frames and resets on full loss/filter reset. During motion toward the
+reference it moves toward zero by `20*|v_db|*dt`, without crossing zero.
+`Ufric` is continuous,
+ramps over `0.20 cm` beyond the position deadband and is bounded to
+`+/-20 cm/s2`. Final `a_fb` is bounded to `+/-140 cm/s2`.
+The LCD can change `Kp/Kd/Ki` live in `0.1` steps. Schema 6 continues to carry
+the applied `Kp/Kd/Ka` and complete final `a_fb`; it has no `Ki` field and the
+reserved bytes remain zero. The MCU must not calculate or add the PI-D term a
+second time.
 
 `x_ref` is the currently applied K230 reference, expressed as an absolute
 calibrated X coordinate in centimeters. Offsets 8/16 continue to carry absolute
 ball position. The LCD and PC debug output also show `x`, `ref` and `e`. The MCU
 can cross-check position/reference consistency and feedback bounds, but cannot
 reconstruct every quiet-state `a_fb` sample from the UART fields alone. It must
-not apply the same `Kp/Kd` feedback a second time. A
+not apply the same `Kp/Kd` feedback or integrate the same position error a
+second time. A
 future MCU command that changes the reference must define validation, sequence,
 acknowledgement, applied-value reporting and a bounded slew/ramp before it is
-safety-usable. A reference step creates an immediate `Kp*Delta x_ref` change in
-`a_fb`.
+safety-usable. A reference step changes the proportional target by
+`Kp*Delta x_ref`; the existing 25 ms output filter smooths its published
+`a_fb` transition.
 
 When `FEEDBACK_VALID=1`, fixed-point values should satisfy
 `abs((x-x_ref)-e) <= 0.03 cm`; this tolerance covers independent `/100`
@@ -118,8 +128,9 @@ controller.
 Offsets 16 and 18 intentionally repeat the physical X and X-velocity used by
 the control law, preserving the established one-dimensional control offsets
 from schema 4.
-The deadbands and quiet-state stabilization affect only `a_fb`; transmitted
-physical state remains the filtered physical state before these operations.
+The controller's additional position/velocity filters, deadbands, integral and
+output stabilization affect only `a_fb`; transmitted physical state remains
+the tracker output before these operations.
 `Ka` defaults to zero, while `a`
 remains available for diagnostics. `a_fb` is an equivalent ball-acceleration
 feedback component, not a desired pipe angle or actuator/PWM command.
@@ -178,15 +189,17 @@ The MCU owns:
   its validated command transport; the current active stationary `x_ref` is a
   K230 preset and is reported in every frame;
 - car-acceleration sensing/feedforward;
-- any integral or additional state terms;
+- any independently designed moving-trajectory term; K230 already owns the
+  stationary ball-position PI-D correction inside `a_fb`;
 - rolling-ball model inversion and desired pipe angle;
-- measured pipe-angle inner loop;
+- measured pipe-angle inner loop, including any integral state local to that
+  separate angle loop;
 - actuator bounds, stale-data handling and safety arbitration.
 
 For the current K230 preset constant equilibrium reference, `a_fb` already
-contains both the position-error and ball-velocity feedback. The MCU must not
-apply the same `Kp/Kd` terms to `x` a second time. It may add separately
-designed trajectory, integral or disturbance terms only when their ownership
+contains position, velocity and bounded integral correction. The MCU must not
+apply the same K230 PI-D behavior a second time. It may add a
+separately designed trajectory or inner-angle-loop term only when ownership
 and anti-windup rules are explicit. See `docs/BALL_CONTROL_LAW.md` for the
 complete signal flow and rolling-ball inversion.
 
@@ -200,7 +213,8 @@ carried a desired angle at payload 28..29; neither may be decoded as schema 6.
 ## Verification boundary
 
 K230 host tests cover fixed length, scales, signed values, CRC, split/coalesced
-frames, noise recovery, motion hysteresis and feedback stabilization/bounds.
+frames, noise recovery, motion hysteresis, PI-D anti-windup and feedback
+stabilization/bounds.
 The MCU decoder has not been modified in this task and must be updated
 separately for schema 6. End-to-end
 UART, sign convention, physical calibration, controller composition and

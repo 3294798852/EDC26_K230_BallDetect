@@ -9,7 +9,7 @@ angle, and it does not calculate a pipe-angle, PWM or motor command.
 
 ```text
 K230: preset x_ref + image -> tracked/calibrated x, v, a
-      -> e=x-x_ref -> state feedback a_fb
+      -> e=x-x_ref -> filtered PI-D -> a_fb
 MCU:  car feedforward + a_fb -> plant inversion -> angle inner loop
 ```
 
@@ -78,13 +78,23 @@ interface for future reference-selection logic. It accepts only finite values
 within `+/-12.5 cm`. The current application does not parse an MCU command and
 does not silently change the reference at runtime. A later command interface
 should rate-limit or ramp large reference changes, because an instantaneous
-step `Delta x_ref` produces an immediate feedback step `Kp*Delta x_ref`.
+step `Delta x_ref` changes the proportional target by `Kp*Delta x_ref`.
+Changing the reference preserves the current integral correction. A full
+runtime/filter reset clears that correction together with the filtered state.
 
-K230 calculates a feedback-equivalent ball acceleration:
+K230 calculates a continuous feedback-equivalent ball acceleration:
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
+e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
+e_db = Db(e_f, 0.10)
+Ufric = -20 * clamp(e_db / 0.20, -1, +1)
+if e_f*v_db < 0 and I != 0:
+    I = move_toward_zero(I, 20*abs(v_db)*dt)
+else:
+    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
+a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
+a_fb = Sat140(LPF(a_raw, 25 ms))
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
@@ -92,42 +102,70 @@ Default values are:
 
 ```text
 Kp = 8.0  1/s^2
-Kd = 7.5  1/s
+Kd = 12.0  1/s
+Ki = 12.0  1/s^3
 Ka = 0.0  dimensionless
+|Ufric| <= 20 cm/s^2
+|I| <= 80 cm/s^2
 |a_fb| <= 140 cm/s^2
 ```
 
-Physical `x` and `v` are converted directly from the single alpha-beta tracker;
-there is no unconditional second low-pass stage, avoiding extra motion lag. A
-continuous soft deadband removes the first `0.12 cm` of position and `0.40 cm/s`
-of velocity only in the feedback calculation. UART continues to publish the
-tracked physical state before this deadband. `a` remains a bounded low-pass
-difference of tracked velocity and is still published for diagnostics, but its
-default feedback coefficient is zero because camera differentiation remains
-noise-sensitive at the measured camera frame rate.
+`Kp`, `Kd` and `Ki` can be adjusted from the LCD `-`/`+` buttons in `0.1`
+steps. Each press triggers once; values take effect immediately and are not
+saved across reboot. A touch fault is reported on LCD/PC debug and does not stop
+camera, control or UART processing.
 
-The tracker also reports an internal `QUIET/PENDING/MOVING` state. Both
-`PENDING` and confirmed `MOVING` velocity enter the `Kd` term, preserving
-braking while a stop or reversal is still being confirmed. Only `QUIET` removes
-the velocity term. A transition from `QUIET` requires at least two reliable
-same-direction center measurements; low-quality, single-support, spread or
-closely competing Hough measurements require three. The first measurement never
-creates a new velocity, while the confirming frame estimates motion from the
-pre-transition anchor. A moving track must then observe four consecutive axial
-center steps no larger than `0.75 px` before it can return to `QUIET`. Confirmed motion uses
-the raw feedback target immediately; sustained non-moving output approaches its
-target with gain `0.35`. The configured hysteresis is zero, so the filtered
-feedback continues converging to zero rather than sticking at a residual value.
-Transition away from `MOVING`, filter reset and invalid feedback reset the
-stabilization state. This changes only `a_fb`; UART still publishes the tracked
-physical `x/v/a`, and schema 6 remains exactly 64 bytes.
+UART publishes the tracked physical `x/v/a` before the controller's additional
+25/50 ms position/velocity filters and soft deadbands. The controller applies
+the first `0.10 cm` of position error and `0.35 cm/s` of velocity as continuous
+soft deadbands. Only when both filtered values are inside their deadbands is the
+dynamic feedback considered settled.
+
+`Ufric` is a continuous bounded approximation of static-friction breakaway
+compensation. It is zero inside the position soft deadband, grows linearly over
+the next `0.20 cm`, and is then limited to `20 cm/s2`. It has no motion-state
+switch and changes sign continuously through the reference. The configured
+magnitude should be about 70--85% of the measured actuator command required to
+start the ball, so it assists breakaway without driving a limit cycle alone.
+
+The integral correction `I` estimates the remaining constant disturbance such
+as fixed vehicle/pipe tilt. It integrates at most `+/-1 cm` of soft-deadband
+position error, has no default leakage, and is bounded to `+/-80 cm/s2`. It
+holds during bounded prediction and when both position and velocity are
+settled. When filtered velocity is toward the reference (`e_f*v_db < 0`), the
+integral moves toward zero at `20*|v_db| cm/s3`; equivalently, each centimeter
+of actual return travel removes at most `20 cm/s2`. The velocity soft deadband
+prevents stationary tracking noise from eroding the correction, and each update
+is capped at zero so it cannot reverse the integral sign. LCD/PC state is
+`UNWIND` while this path is active. An accumulating update that would push the
+combined PD, `Ufric` and integral output
+farther into the `140 cm/s2` limit is rejected (conditional anti-windup).
+Invalid feedback or a full loss/filter reset clears the integral and filtered
+control state. LCD shows `F` for `Ufric`; LCD and PC debug show `I` and its
+state.
+
+The `80 cm/s2` integral limit corresponds to roughly `6.6 deg` of static
+pipe-angle authority under the documented `5/7*g` rolling model. Larger
+installation errors should be fixed mechanically rather than hidden by raising
+this limit. `a` remains a bounded low-pass velocity difference for diagnostics;
+`Ka=0` by default because camera-derived acceleration is noise-sensitive.
+
+The tracker still reports `QUIET/PENDING/MOVING` for diagnostics, but those
+labels do not switch the PI-D equation or its derivative term. The same fixed
+filters and equation run on every valid frame, avoiding control discontinuities
+when the tracker's motion classification changes. Schema 6 remains exactly 64
+bytes.
 
 The reference changes only the position-error term. UART still publishes the
 absolute calibrated `x` and continues to publish absolute `v/a`. Schema 6 also
 publishes the active `x_ref`, `e`, reserved `v_ref/a_ref` fields and reference
 source/status flags in a fixed 64-byte frame. `a_fb` already incorporates
-`x_ref`; transmitting the reference lets the MCU log and cross-check the K230
-calculation but does not transfer ownership of the same feedback term.
+`x_ref` and the integral correction; transmitting the reference lets the
+MCU log and cross-check the K230 calculation but does not transfer ownership of
+the same feedback term. Schema 6 has no separate `Ki` or integral-state field:
+the existing
+`a_fb` field is the complete value the MCU should compose into its plant model.
+The LCD and PC debug output expose `Ki`, the integral correction and its state.
 
 The displayed `e` is a control error and is forced to zero when feedback is
 invalid; do not interpret it as a valid measurement in `LOST` state.
@@ -156,8 +194,9 @@ a_ball_cmd = a_fb + a_extra
 ```
 
 where `a_extra` is zero unless the MCU deliberately owns an additional term.
-Do not calculate `-Kp*(x-x_ref)-Kd*v` again on the MCU: it is already inside
-`a_fb`. For a later moving trajectory, either move the full reference state
+Do not calculate `-Kp*(x-x_ref)-Kd*v` or integrate the same position error again
+on the MCU: both the fast state feedback and stationary-error correction are
+already inside `a_fb`. For a later moving trajectory, either move the full reference state
 `X/X_dot/X_ddot` to one controller or define a richer command explicitly;
 updating only `x_ref` is a stationary-equilibrium interface.
 
@@ -218,11 +257,19 @@ the MCU has the information required for plant inversion and safety arbitration.
    moving the ball manually with actuators disabled.
 3. Verify `a_fb` opposes displacement and motion; a sign error must be fixed
    before enabling any MCU actuator output.
-4. Tune `Kp/Kd` with `Ka=0`, then introduce only a small `Ka` if acceleration
-   feedback improves measured response without amplifying frame jitter.
-5. With a static ball, verify the screen remains mostly `MQ`; an occasional
+4. Start with `Ki=0` and tune `Kp/Kd` for fast, damped return. Then raise `Ki`
+   gradually until a constant installation tilt is rejected without slow
+   oscillation. The touch panel changes all three gains live in `0.1` steps.
+5. Measure the smallest sustained command that starts a stationary ball and set
+   breakaway magnitude to about 70--85% of it. If small-error oscillation
+   appears, reduce breakaway magnitude first; if the ball still sticks, raise it
+   gradually. If integral compensation overshoots, reduce `Ki` before changing
+   the `+/-80 cm/s2` limit. If `UNWIND` removes correction too early or too
+   slowly, reduce or raise `FEEDBACK_INTEGRAL_UNWIND_GAIN_S2`; keep `Ka=0`
+   unless acceleration feedback proves useful without noise.
+6. With a static ball, verify the screen remains mostly `MQ`; an occasional
    `MP1W` or `MP1C` must return without creating a velocity/feedback spike.
-6. On the MCU, distinguish `DETECT`, bounded `HOLD`, and `LOST` from the flag
+7. On the MCU, distinguish `DETECT`, bounded `HOLD`, and `LOST` from the flag
    combinations. Reject stale, CRC-invalid or `FEEDBACK_VALID=0` frames.
 
 Host tests validate equations, bounds and serialization only. Camera scale,

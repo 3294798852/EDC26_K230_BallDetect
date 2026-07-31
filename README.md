@@ -200,7 +200,15 @@ calculates only the camera-state feedback component
 
 ```text
 e = x - x_ref
-a_fb = -(Kp*Db(e, 0.12) + Kd*Db(v, 0.40) + Ka*a)
+e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
+e_db = Db(e_f, 0.10)
+Ufric = -20 * clamp(e_db / 0.20, -1, +1)
+if e_f*v_db < 0 and I != 0:
+    I = move_toward_zero(I, 20*abs(v_db)*dt)
+else:
+    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
+a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
+a_fb = clamp(LPF(a_raw, 25 ms), +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
@@ -213,24 +221,31 @@ reference command is parsed in this version. UART continues to publish absolute
 64-byte frame and also carries the active `x_ref`, `e`, zero-valued reserved
 `v_ref/a_ref`, reference source/status flags and six reserved zero bytes.
 
-Defaults are `Kp=8.0`, `Kd=7.5`, `Ka=0`, with `a_fb` bounded to
-`+/-140 cm/s2`. No second physical-state low-pass is applied: `x/v` are converted
-directly from the single alpha-beta tracker to avoid additional phase lag.
-Continuous soft deadbands of `0.12 cm` for position and `0.40 cm/s` for velocity
-apply only when calculating feedback; UART still reports the tracked physical
-state itself. Acceleration remains published for diagnostics but is disabled in
-the default feedback law. Velocity damping remains active in both `PENDING` and
-`MOVING`; only `QUIET` removes the derivative term. A moving track needs four
-consecutive near-zero axial center steps before entering `QUIET`, preventing an
-early loss of braking during settling. Sustained non-moving feedback follows its
-raw target with gain `0.35` and zero hysteresis, so stationary jitter is reduced
-without leaving a nonzero stuck output. These values are configurable near the
-top of `main.py`; UART fields and the fixed 64-byte schema remain unchanged.
+Defaults are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. Position, velocity and
+output filters use `25/50/25 ms` time constants. Position and velocity soft
+deadbands are `0.10 cm` and `0.35 cm/s`; both must be inside their bands before
+the dynamic feedback is treated as settled. The integral correction is bounded
+to `+/-80 cm/s2`, integrates at most `+/-1 cm` error without default leakage,
+and holds during predicted frames. Whenever filtered velocity is toward the
+reference, the stored integral moves toward zero by `20*|v|*dt`; the velocity
+soft deadband rejects stationary jitter and the update cannot cross zero. A
+continuous static-friction term ramps from zero to `20 cm/s2` over the first
+`0.20 cm` beyond the position deadband, then stays bounded. Final `a_fb` remains
+bounded to `+/-140 cm/s2`. UART still reports the tracked physical state before
+control deadbands.
+
+The bottom LCD panel provides `Kp/Kd/Ki` `-` and `+` buttons. Each distinct
+press changes one gain by `0.1`; holding or moving a finger does not repeat.
+Changes apply immediately, remain RAM-only, and reset to the constants in
+`main.py` after reboot. Touch initialization/read failures are shown on LCD and
+PC debug while vision and UART continue; initialization retries every two
+seconds. Set `TOUCH_PID_ENABLED=False` to remove polling and the panel.
 
 K230 does not receive a moving `X(t)` trajectory, car acceleration or pipe
 angle and does not calculate desired pipe angle, PWM or motor commands. The
 active stationary `x_ref` is currently the K230 preset transmitted in schema
-6. The MCU combines `a_fb` with car feedforward, performs the ball/pipe model
+6. The MCU combines the complete `a_fb` (already including the K230 steady
+correction) with car feedforward, performs the ball/pipe model
 inversion and closes the measured-angle inner loop; it owns any future moving
 trajectory generator and validated command path.
 
@@ -298,9 +313,11 @@ the next loop and a stalled write cannot grow without bound.
 
 K230 emits one fixed 64-byte schema-6 frame per detector run. It carries raw
 pixel coordinates, calibrated physical X/Y position and velocity, physical
-X acceleration, `a_fb`, `Kp/Kd/Ka`, detector time, freshness flags, active
+X acceleration, final `a_fb`, `Kp/Kd/Ka`, detector time, freshness flags, active
 `x_ref`, `e=x-x_ref`, reserved reference velocity/acceleration and reference
 source/status flags. The final six payload bytes are reserved and zero. This
+schema does not add separate `Ki` or integral-state fields; LCD and PC debug
+expose them while transmitted `a_fb` already includes the full PI-D result. This
 application does not read MCU control data, does not use
 the legacy `HELLO`/`STATUS`/`ACK` handshake and never waits for a response. See
 `docs/MCU_UART_PROTOCOL.md` for exact offsets, scales, CRC and safety rules.
@@ -430,9 +447,8 @@ actuator safety.
 ## Verification boundary
 
 Host checks validate detector selection, ROI/Hough geometry, multi-circle
-fusion, single-jump rejection, quality/competition-aware motion confirmation,
-fast two-frame acquisition/reversal, association rules, feedback stabilization,
-fixed-point protocol and parser recovery. They cannot establish
+fusion, continuous PI-D bounds/deadbands, fixed-point protocol and parser
+recovery. They cannot establish
 RGB565 threshold behavior, K230 execution time or camera differentiation noise. The
 camera currently requests 60 FPS; use the measured on-screen FPS and frame
 period to determine whether the active sensor/driver mode delivers it.

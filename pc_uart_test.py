@@ -912,6 +912,12 @@ def run_self_test():
     _run_pc_debug_format_self_test()
 
     from ball_control import BallStateFeedback
+    from ball_control_backends import (
+        PID_BACKEND,
+        REFERENCE_BACKEND,
+        ReferenceProfileFeedback,
+        create_control_backend,
+    )
 
     controller = BallStateFeedback(x_calibration_mode=X_CALIBRATION_MEASURED)
     assert (controller.kp, controller.kd, controller.ki, controller.ka) == (
@@ -920,10 +926,9 @@ def run_self_test():
     assert controller.position_deadband_cm == 0.10
     assert controller.velocity_deadband_cm_s == 0.35
     assert controller.integral_limit_cm_s2 == 80.0
-    assert controller.integral_leak_per_s == 0.0
-    assert controller.integral_unwind_gain_s2 == 20.0
-    assert controller.breakaway_accel_cm_s2 == 20.0
-    assert controller.breakaway_transition_cm == 0.20
+    assert controller.integral_leak_per_s == 0.15
+    assert not controller.dither_enabled
+    assert controller.dither_amplitude_cm_s2 == 5.0
     assert controller.set_gains(kp=8.1, kd=12.1, ki=12.1)[:3] == (
         8.1, 12.1, 12.1
     )
@@ -958,74 +963,229 @@ def run_self_test():
     assert not active_feedback["joint_deadband_active"]
     assert active_feedback["feedback_acceleration_cm_s2"] < 0.0
 
-    breakaway_controller = BallStateFeedback(
+    def scheduled_feedback_at(position_cm, velocity_cm_s, enabled=True):
+        schedule_controller = BallStateFeedback(
+            kp=8.0,
+            kd=12.0,
+            ki=0.0,
+            ka=0.0,
+            max_feedback_accel_cm_s2=500.0,
+            position_deadband_cm=0.0,
+            velocity_deadband_cm_s=0.0,
+            position_filter_tau_s=0.0,
+            velocity_filter_tau_s=0.0,
+            feedback_filter_tau_s=0.0,
+            pd_schedule_enabled=enabled,
+            pd_schedule_radius_cm=5.0,
+            pd_schedule_kp_max_scale=3.0,
+            pd_schedule_kd_max_scale=5.0,
+            x_calibration_mode=X_CALIBRATION_MEASURED,
+        )
+        scheduled_state = dict(settled_state)
+        scheduled_state["x"] = x_pixel_for_position_cm(
+            position_cm,
+            measured_lut,
+        )
+        local_scale = x_position_and_scale(
+            scheduled_state["x"],
+            measured_lut,
+        )[1]
+        scheduled_state["vx"] = float(velocity_cm_s) / local_scale
+        return schedule_controller.update(
+            scheduled_state,
+            reference_candidate,
+            1500,
+        )
+
+    far_schedule = scheduled_feedback_at(5.0, 1.0)
+    assert far_schedule["pd_schedule_kp_scale"] == 1.0
+    assert far_schedule["pd_schedule_kd_scale"] == 1.0
+    assert far_schedule["effective_kp"] == 8.0
+    assert far_schedule["effective_kd"] == 12.0
+    middle_schedule = scheduled_feedback_at(2.5, 1.0)
+    assert abs(middle_schedule["pd_schedule_kp_scale"] - 2.0) < 0.000001
+    assert abs(middle_schedule["pd_schedule_kd_scale"] - 3.0) < 0.000001
+    assert abs(middle_schedule["effective_kp"] - 16.0) < 0.000001
+    assert abs(middle_schedule["effective_kd"] - 36.0) < 0.000001
+    center_schedule = scheduled_feedback_at(0.0, 1.0)
+    assert center_schedule["pd_schedule_kp_scale"] == 3.0
+    assert center_schedule["pd_schedule_kd_scale"] == 5.0
+    assert center_schedule["effective_kp"] == 24.0
+    assert center_schedule["effective_kd"] == 60.0
+    disabled_schedule = scheduled_feedback_at(0.0, 1.0, enabled=False)
+    assert disabled_schedule["pd_schedule_kp_scale"] == 1.0
+    assert disabled_schedule["pd_schedule_kd_scale"] == 1.0
+    assert disabled_schedule["effective_kp"] == 8.0
+    assert disabled_schedule["effective_kd"] == 12.0
+
+    dither_controller = BallStateFeedback(
         kp=0.0,
         kd=0.0,
         ki=0.0,
         ka=0.0,
-        position_deadband_cm=0.10,
-        velocity_deadband_cm_s=0.0,
         position_filter_tau_s=0.0,
         velocity_filter_tau_s=0.0,
         feedback_filter_tau_s=0.0,
-        breakaway_accel_cm_s2=20.0,
-        breakaway_transition_cm=0.20,
+        dither_enabled=True,
+        dither_amplitude_cm_s2=5.0,
+        dither_seed=1,
         x_calibration_mode=X_CALIBRATION_MEASURED,
     )
-    breakaway_state = dict(settled_state)
-    breakaway_state["vx"] = 0.0
-    breakaway_state["x"] = x_pixel_for_position_cm(0.20, measured_lut)
-    breakaway_feedback = breakaway_controller.update(
-        breakaway_state,
+    dither_values = []
+    for update_index in range(8):
+        dither_feedback = dither_controller.update(
+            settled_state,
+            reference_candidate,
+            2000 + update_index * 33,
+        )
+        dither_value = dither_feedback["feedback_dither_cm_s2"]
+        assert 0.0 < abs(dither_value) <= 5.0
+        assert abs(
+            dither_feedback["feedback_acceleration_cm_s2"] - dither_value
+        ) < 0.000001
+        dither_values.append(round(dither_value, 6))
+    for value_index in range(1, len(dither_values)):
+        assert dither_values[value_index - 1] * dither_values[value_index] < 0.0
+    for value_index in range(0, len(dither_values), 2):
+        assert abs(
+            abs(dither_values[value_index])
+            - abs(dither_values[value_index + 1])
+        ) < 0.000001
+    assert len(set(abs(value) for value in dither_values)) > 1
+    lost_dither_feedback = dither_controller.update(
+        {"track_valid": False},
         reference_candidate,
-        2000,
+        2300,
     )
-    assert abs(breakaway_feedback["breakaway_feedback_cm_s2"] + 10.0) < 0.01
-    assert abs(breakaway_feedback["feedback_acceleration_cm_s2"] + 10.0) < 0.01
-    breakaway_state["x"] = x_pixel_for_position_cm(-0.50, measured_lut)
-    breakaway_feedback = breakaway_controller.update(
-        breakaway_state,
+    assert lost_dither_feedback["feedback_acceleration_cm_s2"] == 0.0
+    assert lost_dither_feedback["feedback_dither_cm_s2"] == 0.0
+    resumed_dither_feedback = dither_controller.update(
+        settled_state,
         reference_candidate,
-        2033,
+        2333,
     )
-    assert abs(breakaway_feedback["breakaway_feedback_cm_s2"] - 20.0) < 0.01
+    assert (
+        dither_values[-1]
+        * resumed_dither_feedback["feedback_dither_cm_s2"]
+        < 0.0
+    )
 
-    unwind_controller = BallStateFeedback(
-        kp=0.0,
-        kd=0.0,
-        ki=12.0,
-        ka=0.0,
-        position_deadband_cm=0.0,
-        velocity_deadband_cm_s=0.0,
-        position_filter_tau_s=0.0,
-        velocity_filter_tau_s=0.0,
-        feedback_filter_tau_s=0.0,
-        integral_unwind_gain_s2=20.0,
-        breakaway_accel_cm_s2=0.0,
-        x_calibration_mode=X_CALIBRATION_MEASURED,
+    common_control_settings = {
+        "position_filter_tau_s": 0.0,
+        "velocity_filter_tau_s": 0.0,
+        "feedback_filter_tau_s": 0.0,
+        "dither_enabled": False,
+        "x_calibration_mode": X_CALIBRATION_MEASURED,
+    }
+    factory_pid = create_control_backend(
+        PID_BACKEND,
+        dict(common_control_settings),
     )
-    unwind_controller.integral_correction_cm_s2 = -40.0
-    unwind_state = dict(settled_state)
-    unwind_state["x"] = x_pixel_for_position_cm(2.0, measured_lut)
-    unwind_scale = x_position_and_scale(
-        unwind_state["x"], measured_lut
-    )[1]
-    unwind_state["vx"] = -5.0 / unwind_scale
-    unwind_feedback = unwind_controller.update(
-        unwind_state,
+    direct_pid = BallStateFeedback(**dict(common_control_settings))
+    assert factory_pid.backend_name == PID_BACKEND
+    factory_pid_feedback = factory_pid.update(
+        active_state,
         reference_candidate,
         3000,
     )
-    assert abs(unwind_feedback["steady_correction_cm_s2"] + 36.5) < 0.01
-    assert unwind_feedback["steady_correction_unwind_active"]
-    assert unwind_feedback["steady_correction_state"] == "UNWIND"
-    unwind_controller.integral_correction_cm_s2 = -0.5
-    unwind_feedback = unwind_controller.update(
-        unwind_state,
+    direct_pid_feedback = direct_pid.update(
+        active_state,
         reference_candidate,
-        3033,
+        3000,
     )
-    assert unwind_feedback["steady_correction_cm_s2"] == 0.0
+    assert abs(
+        factory_pid_feedback["feedback_acceleration_cm_s2"]
+        - direct_pid_feedback["feedback_acceleration_cm_s2"]
+    ) < 0.000001
+
+    reference_backend = create_control_backend(
+        REFERENCE_BACKEND,
+        dict(common_control_settings),
+        {"source_axis_length_px": 383.0, "pipe_length_cm": 25.0},
+    )
+    assert isinstance(reference_backend, ReferenceProfileFeedback)
+    assert not reference_backend.pd_schedule_enabled
+    assert abs(reference_backend.source_pixels_per_cm - 15.32) < 0.000001
+    reference_feedback = reference_backend.update(
+        active_state,
+        reference_candidate,
+        3000,
+    )
+    assert reference_feedback["control_backend"] == REFERENCE_BACKEND
+    assert reference_feedback["feedback_acceleration_cm_s2"] < 0.0
+    assert reference_backend._derivative_brake_scale(3.0, -1.0) == 0.20
+    assert reference_backend._derivative_brake_scale(3.0, 1.0) == 1.0
+
+    saturated_reference_backend = create_control_backend(
+        REFERENCE_BACKEND,
+        dict(common_control_settings),
+    )
+    saturated_state = dict(active_state)
+    saturated_state["x"] = x_pixel_for_position_cm(10.0, measured_lut)
+    saturated_scale = x_position_and_scale(
+        saturated_state["x"],
+        measured_lut,
+    )[1]
+    saturated_state["vx"] = 100.0 / saturated_scale
+    saturated_feedback = saturated_reference_backend.update(
+        saturated_state,
+        reference_candidate,
+        3000,
+    )
+    assert saturated_feedback["feedback_saturated"]
+    assert abs(saturated_feedback["reference_correction_deg"]) == 10.0
+
+    breakaway_state = dict(active_state)
+    breakaway_state["vx"] = 0.0
+    for update_ms in (3100, 3233, 3366, 3499):
+        breakaway_feedback = reference_backend.update(
+            breakaway_state,
+            reference_candidate,
+            update_ms,
+        )
+    assert breakaway_feedback["reference_profile"] == "BREAKAWAY"
+    assert abs(breakaway_feedback["reference_breakaway_deg"]) > 0.0
+    frozen_breakaway_deg = breakaway_feedback["reference_breakaway_deg"]
+    frozen_trim_deg = breakaway_feedback["reference_trim_deg"]
+    frozen_integral_px_s = reference_backend.reference_integral_px_s
+    predicted_state = dict(breakaway_state)
+    predicted_state["measurement_accepted"] = False
+    predicted_state["predicted"] = True
+    predicted_state["missed_frames"] = 1
+    predicted_state["measurement_age_ms"] = 33
+    predicted_feedback = reference_backend.update(
+        predicted_state,
+        None,
+        3532,
+    )
+    assert predicted_feedback["feedback_valid"]
+    assert predicted_feedback["reference_adaptation_frozen"]
+    assert predicted_feedback["reference_breakaway_deg"] == frozen_breakaway_deg
+    assert predicted_feedback["reference_trim_deg"] == frozen_trim_deg
+    assert reference_backend.reference_integral_px_s == frozen_integral_px_s
+
+    limited_reference_backend = create_control_backend(
+        REFERENCE_BACKEND,
+        dict(common_control_settings, max_feedback_accel_cm_s2=20.0),
+    )
+    limit_feedback = limited_reference_backend.update(
+        active_state,
+        reference_candidate,
+        4000,
+    )
+    assert abs(limit_feedback["feedback_acceleration_cm_s2"]) <= 20.0
+    lost_reference_feedback = limited_reference_backend.update(
+        {"track_valid": False},
+        None,
+        4033,
+    )
+    assert not lost_reference_feedback["feedback_valid"]
+    assert lost_reference_feedback["feedback_acceleration_cm_s2"] == 0.0
+    try:
+        create_control_backend("unknown", dict(common_control_settings))
+        raise AssertionError("unknown control backend must fail")
+    except ValueError:
+        pass
 
     candidate = {
         "confidence": 0.92,

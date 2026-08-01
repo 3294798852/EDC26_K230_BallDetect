@@ -126,7 +126,11 @@ If both boxes trail the ball, improve exposure or ROI candidate geometry. If
 only cyan trails orange, tune the `TRACK_AXIAL_*` observer constants.
 
 Axial position gain rises with innovation and reaches its fast value by
-`TRACK_AXIAL_RESPONSE_FULL_PX`. Axial velocity accumulates subpixel movement
+`TRACK_AXIAL_RESPONSE_FULL_PX`. The current low-lag profile uses `0.40` as its
+base axial gain, reaches `0.96` at `0.75 px`, and uses `0.50/0.90` as the normal
+and fast velocity gains. Before motion confirmation, reliable/ambiguous
+position gains are `0.24/0.18`; the two/three-frame confirmation rule remains
+unchanged to reject one-frame false circles. Axial velocity accumulates subpixel movement
 until either `TRACK_VELOCITY_NOISE_PX` is crossed or
 `TRACK_VELOCITY_QUIET_TIMEOUT_MS` confirms a stationary interval; lowering the
 distance threshold alone converts detector jitter into speed. A sufficiently

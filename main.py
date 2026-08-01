@@ -30,6 +30,7 @@ PIXEL_FORMAT_YUV_SEMIPLANAR_420 = 0
 PipeMotionFilter = None
 normalize_postprocessed_ball_candidates = None
 BallStateFeedback = None
+create_control_backend = None
 RoiDarkBlobDetector = None
 EdgeHoughCircleDetector = None
 WifiVideoService = None
@@ -110,6 +111,8 @@ try:
     )
     _BOOT_IMPORT_STAGE = "import_ball_control"
     from ball_control import BallStateFeedback
+    _BOOT_IMPORT_STAGE = "import_ball_control_backends"
+    from ball_control_backends import create_control_backend
     _BOOT_IMPORT_STAGE = "import_ball_calibration"
     from ball_calibration import (
         X_CALIBRATION_MEASURED,
@@ -128,7 +131,7 @@ except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.60"
+APP_VERSION = "proj2-1.72"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -212,10 +215,12 @@ PIPE_POSITIVE_END_Y_PX = 160.0
 # is the current physical-ruler fit; "pinhole" preserves the original model.
 X_CALIBRATION_MODE = X_CALIBRATION_MEASURED
 
-# K230 publishes a continuous camera-derived PI-D term. The control equation
-# never switches on tracker motion labels. Small soft deadbands are applied to
-# position and velocity independently, so dynamic feedback is zero only when
-# both values are small.
+# Select "pid" for the established controller or "reference_profile" for the
+# physical-unit port of the supplied upper-computer balance-ball algorithm.
+CONTROL_BACKEND = "pid"
+
+# Common feedback transport, validity, filtering and output limits. Both
+# backends publish the same cm/s2 result and use the unchanged UART schema.
 FEEDBACK_KP = 8.0
 FEEDBACK_KD = 12.0
 FEEDBACK_KI = 12.0
@@ -228,13 +233,59 @@ FEEDBACK_VELOCITY_FILTER_TAU_S = 0.050
 FEEDBACK_OUTPUT_FILTER_TAU_S = 0.025
 FEEDBACK_INTEGRAL_LIMIT_CM_S2 = 80.0
 FEEDBACK_INTEGRAL_ERROR_LIMIT_CM = 1.0
-# Continuous static-friction compensation. It ramps linearly from zero over
-# the first 0.20 cm beyond the position soft deadband, then stays at 20 cm/s2.
-# Measure the real breakaway threshold and keep this at roughly 70--85% of it.
-FEEDBACK_INTEGRAL_LEAK_PER_S = 0.0
-FEEDBACK_INTEGRAL_UNWIND_GAIN_S2 = 20.0
-FEEDBACK_BREAKAWAY_ACCEL_CM_S2 = 20.0
-FEEDBACK_BREAKAWAY_TRANSITION_CM = 0.20
+FEEDBACK_INTEGRAL_LEAK_PER_S = 0.15
+# PID-only near-target gain schedule. At |e| >= 5 cm the touch-adjusted base
+# gains are used. Toward e=0, Kp rises linearly to 3x and Kd to 5x. The
+# reference_profile backend has its own D schedule and ignores these settings.
+FEEDBACK_PD_SCHEDULE_ENABLED = True
+FEEDBACK_PD_SCHEDULE_RADIUS_CM = 5.0
+FEEDBACK_PD_SCHEDULE_KP_MAX_SCALE = 3.0
+FEEDBACK_PD_SCHEDULE_KD_MAX_SCALE = 5.0
+# Paired random-magnitude feedback dither used to overcome static friction.
+# Every valid frame reverses direction; each pair has equal magnitude. Disable
+# to recover the unchanged deterministic PI-D output path.
+FEEDBACK_DITHER_ENABLED = True
+FEEDBACK_DITHER_AMPLITUDE_CM_S2 = 5.0
+
+# Source-controller parameters remain in their documented pixel/degree units
+# here and are converted once at backend initialization. Source telemetry
+# measured a 383 px pipe axis; this project calibrates the same pipe to 25 cm.
+# Motor angle limits, motor rate limits and car feedforward remain MCU duties.
+REFERENCE_CONTROL_SETTINGS = {
+    "source_axis_length_px": 383.0,
+    "pipe_length_cm": 25.0,
+    "rolling_kp_deg_per_px": 0.035,
+    "rolling_ki_deg_per_px_s": 0.0,
+    "rolling_kd_deg_s_per_px": 0.012,
+    "deadband_px": 3.0,
+    "proportional_limit_deg": 8.0,
+    "derivative_limit_deg": 5.0,
+    "dynamic_tilt_limit_deg": 10.0,
+    "target_brake_start_px": 30.0,
+    "target_brake_full_px": 8.0,
+    "target_brake_far_scale": 0.20,
+    "integral_active_error_px": 15.0,
+    "integral_active_velocity_px_s": 10.0,
+    "stationary_kp_deg_per_px": 0.055,
+    "stationary_confirm_s": 0.35,
+    "stationary_velocity_px_s": 2.0,
+    "rolling_enter_velocity_px_s": 6.0,
+    "rolling_enter_displacement_px": 1.5,
+    "breakaway_error_min_px": 5.0,
+    "breakaway_initial_deg": 3.0,
+    "breakaway_max_deg": 5.0,
+    "breakaway_ramp_deg_s": 12.0,
+    "breakaway_escalation_deg_s": 0.8,
+    "breakaway_error_gain_deg_per_px": 1.8,
+    "breakaway_release_deg_s": 30.0,
+    "trim_enabled": True,
+    "trim_deadband_px": 5.0,
+    "trim_gain_deg_per_px_s": 0.40,
+    "trim_max_deg": 4.0,
+    "trim_max_rate_deg_s": 1.2,
+    "trim_activation_s": 0.20,
+    "trim_velocity_gate_px_s": 12.0,
+}
 # Absolute calibrated X coordinate used as the ball equilibrium origin.
 # A future validated algorithm/MCU command may call
 # BallStateFeedback.set_reference_position_cm() to update it at runtime.
@@ -246,11 +297,11 @@ TRACK_HOLD_MAX_MS = 300
 # small noise band; lateral position and apparent diameter remain strongly
 # smoothed because the camera and pipe geometry are fixed.
 TRACK_AXIAL_FAST_ALPHA = 0.96
-TRACK_AXIAL_QUIET_ALPHA = 0.18
+TRACK_AXIAL_QUIET_ALPHA = 0.40
 TRACK_AXIAL_RESPONSE_START_PX = 0.25
-TRACK_AXIAL_RESPONSE_FULL_PX = 1.50
-TRACK_VELOCITY_BETA = 0.30
-TRACK_VELOCITY_FAST_BETA = 0.85
+TRACK_AXIAL_RESPONSE_FULL_PX = 0.75
+TRACK_VELOCITY_BETA = 0.50
+TRACK_VELOCITY_FAST_BETA = 0.90
 TRACK_VELOCITY_NOISE_PX = 0.90
 TRACK_VELOCITY_QUIET_DECAY = 0.35
 TRACK_VELOCITY_QUIET_TIMEOUT_MS = 120
@@ -262,8 +313,8 @@ TRACK_MOTION_IMMEDIATE_PX = 14.0
 TRACK_MOTION_CONFIRM_FRAMES = 2
 TRACK_MOTION_STOP_FRAMES = 4
 TRACK_MOTION_DIRECTION_EPSILON_PX = 0.75
-TRACK_AMBIGUOUS_POSITION_ALPHA = 0.10
-TRACK_QUIET_POSITION_ALPHA = 0.12
+TRACK_AMBIGUOUS_POSITION_ALPHA = 0.18
+TRACK_QUIET_POSITION_ALPHA = 0.24
 TRACK_QUIET_VELOCITY_DECAY = 0.20
 TRACK_QUIET_GATE_DIAMETER_FACTOR = 1.25
 TRACK_QUIET_GATE_MIN_PX = 10.0
@@ -1452,20 +1503,43 @@ class CameraDisplay:
             ),
             COLOR_TITLE,
         )
-        self._draw_text(
-            3,
-            "FB{:+.1f}/{:+.1f} I{:+.1f} F{:+.1f} s={} db={}{}".format(
+        if feedback.get("control_backend") == "reference_profile":
+            feedback_text = (
+                "REF {} FB{:+.1f}/{:+.1f} ang={:+.2f} "
+                "D={:.2f} br={:+.2f} tr={:+.2f}{}"
+            ).format(
+                str(feedback.get("reference_profile", "?"))[:5],
                 float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
                 float(feedback.get(
                     "unfiltered_feedback_acceleration_cm_s2",
                     0.0,
                 )),
+                float(feedback.get("reference_correction_deg", 0.0)),
+                float(feedback.get("reference_brake_scale", 1.0)),
+                float(feedback.get("reference_breakaway_deg", 0.0)),
+                float(feedback.get("reference_trim_deg", 0.0)),
+                " HOLD" if feedback.get("reference_adaptation_frozen") else "",
+            )
+        else:
+            feedback_text = (
+                "PID P{:.2f} D{:.2f} FB{:+.1f}/{:+.1f} "
+                "N{:+.1f} I{:+.1f} {}{}"
+            ).format(
+                float(feedback.get("pd_schedule_kp_scale", 1.0)),
+                float(feedback.get("pd_schedule_kd_scale", 1.0)),
+                float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+                float(feedback.get(
+                    "unfiltered_feedback_acceleration_cm_s2",
+                    0.0,
+                )),
+                float(feedback.get("feedback_dither_cm_s2", 0.0)),
                 float(feedback.get("steady_correction_cm_s2", 0.0)),
-                float(feedback.get("breakaway_feedback_cm_s2", 0.0)),
                 str(feedback.get("steady_correction_state", "?"))[:6],
-                "Y" if feedback.get("joint_deadband_active") else "N",
                 " SAT" if feedback.get("feedback_saturated") else "",
-            ),
+            )
+        self._draw_text(
+            3,
+            feedback_text,
             COLOR_GOOD if feedback.get("feedback_valid") else COLOR_WARN,
         )
         self._draw_text(
@@ -1947,9 +2021,10 @@ def _print_pc_debug_status(
         "q={:.2f},s={}] "
         "phys[p=({:+.2f},{:+.2f}),v=({:+.2f},{:+.2f}),aX={:+.1f},"
         "ref={:+.2f},e={:+.2f}] "
-        "ctrl[e={:+.2f},v={:+.2f},db={}] "
-        "fb[a={:+.1f},raw={:+.1f},kp={:.2f},kd={:.2f},ki={:.2f},"
-        "ka={:.3f},I={:+.2f},F={:+.2f},is={},valid={},sat={}] "
+        "ctrl[be={},e={:+.2f},v={:+.2f},db={},prof={},ang={:+.2f},"
+        "D={:.2f},br={:+.2f},tr={:+.2f},freeze={}] "
+        "fb[a={:+.1f},raw={:+.1f},kp={:.2f}/{:.2f},kd={:.2f}/{:.2f},ki={:.2f},"
+        "ka={:.3f},I={:+.2f},N={:+.2f},is={},valid={},sat={}] "
         "model={} diag={} cal={} exposure={} fps={:.2f}/{} cap_dt={:.2f}ms "
         "time[cap={},{}={},{}={},{}={},det={}]ms "
         "UART[txf={},txb={},q={},e={},s={},z={},d={},rxb={},rxok={},"
@@ -1983,20 +2058,29 @@ def _print_pc_debug_status(
             float(feedback.get("acceleration_cm_s2", 0.0)),
             float(feedback.get("reference_position_cm", 0.0)),
             float(feedback.get("position_error_cm", 0.0)),
+            str(feedback.get("control_backend", "?")),
             float(feedback.get("control_position_error_cm", 0.0)),
             float(feedback.get("feedback_velocity_cm_s", 0.0)),
             "Y" if feedback.get("joint_deadband_active") else "N",
+            str(feedback.get("reference_profile", "-")),
+            float(feedback.get("reference_correction_deg", 0.0)),
+            float(feedback.get("reference_brake_scale", 1.0)),
+            float(feedback.get("reference_breakaway_deg", 0.0)),
+            float(feedback.get("reference_trim_deg", 0.0)),
+            "Y" if feedback.get("reference_adaptation_frozen") else "N",
             float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
             float(feedback.get(
                 "unfiltered_feedback_acceleration_cm_s2",
                 0.0,
             )),
             float(feedback.get("kp", 0.0)),
+            float(feedback.get("effective_kp", 0.0)),
             float(feedback.get("kd", 0.0)),
+            float(feedback.get("effective_kd", 0.0)),
             float(feedback.get("ki", 0.0)),
             float(feedback.get("ka", 0.0)),
             float(feedback.get("steady_correction_cm_s2", 0.0)),
-            float(feedback.get("breakaway_feedback_cm_s2", 0.0)),
+            float(feedback.get("feedback_dither_cm_s2", 0.0)),
             str(feedback.get("steady_correction_state", "?")),
             "Y" if feedback.get("feedback_valid") else "N",
             "Y" if feedback.get("feedback_saturated") else "N",
@@ -2135,33 +2219,42 @@ def main(pc_debug=False):
             ),
         )
         stage = "feedback_init"
-        feedback_filter = BallStateFeedback(
-            kp=FEEDBACK_KP,
-            kd=FEEDBACK_KD,
-            ki=FEEDBACK_KI,
-            ka=FEEDBACK_KA,
-            max_feedback_accel_cm_s2=FEEDBACK_ACCEL_LIMIT_CM_S2,
-            position_deadband_cm=FEEDBACK_POSITION_DEADBAND_CM,
-            velocity_deadband_cm_s=(
-                FEEDBACK_VELOCITY_DEADBAND_CM_S
-            ),
-            max_prediction_age_ms=TRACK_HOLD_MAX_MS,
-            max_prediction_frames=TRACK_HOLD_MAX_FRAMES,
-            x_calibration_mode=X_CALIBRATION_MODE,
-            reference_position_cm=FEEDBACK_REFERENCE_POSITION_CM,
-            reference_state_flags=(
-                BALL_REFERENCE_FLAG_VALID
-                | BALL_REFERENCE_FLAG_SOURCE_PRESET
-            ),
-            position_filter_tau_s=FEEDBACK_POSITION_FILTER_TAU_S,
-            velocity_filter_tau_s=FEEDBACK_VELOCITY_FILTER_TAU_S,
-            feedback_filter_tau_s=FEEDBACK_OUTPUT_FILTER_TAU_S,
-            integral_limit_cm_s2=FEEDBACK_INTEGRAL_LIMIT_CM_S2,
-            integral_error_limit_cm=FEEDBACK_INTEGRAL_ERROR_LIMIT_CM,
-            integral_leak_per_s=FEEDBACK_INTEGRAL_LEAK_PER_S,
-            integral_unwind_gain_s2=FEEDBACK_INTEGRAL_UNWIND_GAIN_S2,
-            breakaway_accel_cm_s2=FEEDBACK_BREAKAWAY_ACCEL_CM_S2,
-            breakaway_transition_cm=FEEDBACK_BREAKAWAY_TRANSITION_CM,
+        feedback_filter = create_control_backend(
+            CONTROL_BACKEND,
+            {
+                "kp": FEEDBACK_KP,
+                "kd": FEEDBACK_KD,
+                "ki": FEEDBACK_KI,
+                "ka": FEEDBACK_KA,
+                "max_feedback_accel_cm_s2": FEEDBACK_ACCEL_LIMIT_CM_S2,
+                "position_deadband_cm": FEEDBACK_POSITION_DEADBAND_CM,
+                "velocity_deadband_cm_s": FEEDBACK_VELOCITY_DEADBAND_CM_S,
+                "max_prediction_age_ms": TRACK_HOLD_MAX_MS,
+                "max_prediction_frames": TRACK_HOLD_MAX_FRAMES,
+                "x_calibration_mode": X_CALIBRATION_MODE,
+                "reference_position_cm": FEEDBACK_REFERENCE_POSITION_CM,
+                "reference_state_flags": (
+                    BALL_REFERENCE_FLAG_VALID
+                    | BALL_REFERENCE_FLAG_SOURCE_PRESET
+                ),
+                "position_filter_tau_s": FEEDBACK_POSITION_FILTER_TAU_S,
+                "velocity_filter_tau_s": FEEDBACK_VELOCITY_FILTER_TAU_S,
+                "feedback_filter_tau_s": FEEDBACK_OUTPUT_FILTER_TAU_S,
+                "integral_limit_cm_s2": FEEDBACK_INTEGRAL_LIMIT_CM_S2,
+                "integral_error_limit_cm": FEEDBACK_INTEGRAL_ERROR_LIMIT_CM,
+                "integral_leak_per_s": FEEDBACK_INTEGRAL_LEAK_PER_S,
+                "pd_schedule_enabled": FEEDBACK_PD_SCHEDULE_ENABLED,
+                "pd_schedule_radius_cm": FEEDBACK_PD_SCHEDULE_RADIUS_CM,
+                "pd_schedule_kp_max_scale": (
+                    FEEDBACK_PD_SCHEDULE_KP_MAX_SCALE
+                ),
+                "pd_schedule_kd_max_scale": (
+                    FEEDBACK_PD_SCHEDULE_KD_MAX_SCALE
+                ),
+                "dither_enabled": FEEDBACK_DITHER_ENABLED,
+                "dither_amplitude_cm_s2": FEEDBACK_DITHER_AMPLITUDE_CM_S2,
+            },
+            REFERENCE_CONTROL_SETTINGS,
         )
         stage = "uart_rx_init"
         rx = UartReferenceCommandRx(uart, feedback_filter)
@@ -2175,9 +2268,10 @@ def main(pc_debug=False):
         print(
             "steel-ball tracker started, version={}, backend={}, model={}, "
             "expected={}, UART={} 8N1, frame={}B, software_tx={}B, "
-            "pipeline={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ki={:.2f}, "
-            "fb_ka={:.3f}, fb_i_limit={:.1f}, fb_unwind={:.1f}, "
-            "fb_break={:.1f}/{:.2f}, "
+            "pipeline={}, control={}, fb_kp={:.2f}, fb_kd={:.2f}, fb_ki={:.2f}, "
+            "fb_ka={:.3f}, fb_i_limit={:.1f}, fb_leak={:.2f}, "
+            "fb_pd_sched={}/{:.1f}/{:.1f}x/{:.1f}x, "
+            "fb_dither={}/{:.1f}, "
             "fb_db={:.2f}/{:.2f}, "
             "calibration={}, ref={:+.2f}cm, center_cm_per_px={:.5f}, exposure={}, "
             "net={}, pc_debug={}".format(
@@ -2189,14 +2283,19 @@ def main(pc_debug=False):
                 BALL_STATE_FRAME_SIZE,
                 UART_SOFTWARE_BUFFER_BYTES,
                 detector.pipeline_name,
+                feedback_filter.backend_name,
                 float(feedback_filter.kp),
                 float(feedback_filter.kd),
                 float(feedback_filter.ki),
                 float(feedback_filter.ka),
                 float(feedback_filter.integral_limit_cm_s2),
-                float(feedback_filter.integral_unwind_gain_s2),
-                float(feedback_filter.breakaway_accel_cm_s2),
-                float(feedback_filter.breakaway_transition_cm),
+                float(feedback_filter.integral_leak_per_s),
+                "ON" if feedback_filter.pd_schedule_enabled else "OFF",
+                float(feedback_filter.pd_schedule_radius_cm),
+                float(feedback_filter.pd_schedule_kp_max_scale),
+                float(feedback_filter.pd_schedule_kd_max_scale),
+                "ON" if feedback_filter.dither_enabled else "OFF",
+                float(feedback_filter.dither_amplitude_cm_s2),
                 float(feedback_filter.position_deadband_cm),
                 float(feedback_filter.velocity_deadband_cm_s),
                 feedback_filter.x_calibration_mode,

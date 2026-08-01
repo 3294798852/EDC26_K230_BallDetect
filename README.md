@@ -20,6 +20,7 @@ wifi_video_service.py
 pc_rtsp_receiver.py                    # PC only; RTSP/TCP receiver
 ball_roi_detector.py
 ball_control.py
+ball_control_backends.py                # selectable feedback algorithms
 ball_protocol.py
 ball_tracking.py
 pc_uart_test.py                         # optional dual-mode diagnostic
@@ -163,10 +164,12 @@ enters the existing visible FATAL path rather than being silently ignored.
   velocity anchor. A candidate still near the quiet prediction always outranks a
   distant continuation, so one false jump cannot pull the track away when the
   real stationary ball remains visible. Before confirmation, axial
-  position uses gain `0.12` (`0.10` for an ambiguous cluster), existing velocity
+  position uses gain `0.24` (`0.18` for an ambiguous cluster), existing velocity
   decays by `0.20`, and the measurement cannot create new velocity. Confirmed
-  motion restores the response up to gain `0.96`, while lateral position uses
-  gain `0.08` and lateral velocity is forced to zero. Apparent
+  motion blends from gain `0.40` to `0.96`, reaching the fast gain at a
+  `0.75 px` innovation; axial velocity uses base gain `0.50` and fast gain
+  `0.90`. Lateral position remains at gain `0.08` and lateral velocity is
+  forced to zero. Apparent
   diameter uses a slow, one-pixel-bounded update because the camera geometry is
   fixed. Correction uses the capture-complete timestamp, then predicts only
   across the measured detector latency to the publish instant; this removes the
@@ -194,21 +197,31 @@ possible with a high-order global polynomial. Runtime conversion still uses
 only adjacent table interpolation. Set the mode to `"pinhole"` to restore the
 original `15 cm` distance/`25 cm` field-of-view tangent table unchanged.
 
-`ball_control.py` consumes the selected table for X position and its local
-cm/pixel slope for X velocity, derives acceleration and then
-calculates only the camera-state feedback component
+`CONTROL_BACKEND` in `main.py` selects the camera feedback algorithm without
+changing tracking, calibration or UART framing:
+
+| Value | Behavior |
+| --- | --- |
+| `"pid"` | established physical-unit filtered PI-D controller; default |
+| `"reference_profile"` | port of the supplied balance-ball controller with approach-dependent D action, rolling/stationary/breakaway profiles and slow tilt trim |
+
+Both backends consume calibrated centimeters and cm/s and publish the same
+bounded equivalent ball acceleration `a_fb` in cm/s2. The MCU continues to own
+vehicle-acceleration feedforward, rolling-model inversion, pipe-angle control,
+actuator limits and safe state. No UART decoder change is required.
+
+The default `pid` backend in `ball_control.py` calculates
 
 ```text
 e = x - x_ref
 e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
-e_db = Db(e_f, 0.10)
-Ufric = -20 * clamp(e_db / 0.20, -1, +1)
-if e_f*v_db < 0 and I != 0:
-    I = move_toward_zero(I, 20*abs(v_db)*dt)
-else:
-    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
-a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
-a_fb = clamp(LPF(a_raw, 25 ms), +/-140)
+r = clamp(1 - abs(e_f)/5, 0, 1) when scheduling is enabled, else 0
+Kp_eff = Kp * (1 + 2*r)
+Kd_eff = Kd * (1 + 4*r)
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
+a_fb = clamp(LPF(a_raw, 25 ms) + n, +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
@@ -225,14 +238,49 @@ Defaults are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. Position, velocity and
 output filters use `25/50/25 ms` time constants. Position and velocity soft
 deadbands are `0.10 cm` and `0.35 cm/s`; both must be inside their bands before
 the dynamic feedback is treated as settled. The integral correction is bounded
-to `+/-80 cm/s2`, integrates at most `+/-1 cm` error without default leakage,
-and holds during predicted frames. Whenever filtered velocity is toward the
-reference, the stored integral moves toward zero by `20*|v|*dt`; the velocity
-soft deadband rejects stationary jitter and the update cannot cross zero. A
-continuous static-friction term ramps from zero to `20 cm/s2` over the first
-`0.20 cm` beyond the position deadband, then stays bounded. Final `a_fb` remains
-bounded to `+/-140 cm/s2`. UART still reports the tracked physical state before
-control deadbands.
+to `+/-80 cm/s2`, integrates at most `+/-1 cm` error, leaks at `0.15/s`, and
+holds during predicted frames. Final `a_fb` remains bounded to `+/-140 cm/s2`.
+UART still reports the tracked physical state before control deadbands.
+
+`FEEDBACK_PD_SCHEDULE_ENABLED` controls the PID-only near-target gain schedule.
+With its default 5 cm radius, errors at or beyond 5 cm use the touch-adjusted
+base gains. The scales rise linearly toward the reference, reaching `3x Kp`
+and `5x Kd` at zero error. The position/velocity soft deadbands still act after
+gain selection, so zero position and velocity do not create an output. Disable
+the option to use constant gains exactly. `reference_profile` ignores this
+switch because it already owns a separate target-approach D schedule. LCD shows
+the current P/D scales; PC debug reports base and effective gains.
+
+`FEEDBACK_DITHER_ENABLED` controls a bounded zero-mean uniform dither added
+after the output low-pass filter and before the final clamp. Its default
+amplitude is limited to `+/-5 cm/s2`, set by
+`FEEDBACK_DITHER_AMPLITUDE_CM_S2`. Each random magnitude is reused for two
+valid frames with opposite signs, and the sign flips on every valid
+`DETECT/HOLD` frame to help overcome static friction without a pairwise bias;
+`LOST` still sends zero feedback. The implementation uses a fixed-memory
+32-bit generator and does not depend on a K230 `random` module. Set the switch
+to `False` to recover the deterministic PI-D output exactly.
+
+The `reference_profile` backend is implemented in
+`ball_control_backends.py`. It ports only the source algorithm's ball-feedback
+portion. Source thresholds and gains remain readable in their original
+pixel/degree units in `REFERENCE_CONTROL_SETTINGS`, then are converted once at
+startup with `383 px / 25 cm = 15.32 px/cm`. Its final pipe-angle correction is
+converted to equivalent solid-ball acceleration with
+`a=(5/7)*980.665*sin(theta)` cm/s2. D action is reduced to `0.2` while the ball
+is travelling toward the target farther than 30 source pixels, then increases
+linearly to full strength at 8 pixels; motion away from the target always uses
+full damping. After 0.35 s of confirmed low-speed motion it selects a bounded
+stationary/breakaway profile, while a slow trim estimates steady inclination.
+Integral, trim and breakaway adaptation freeze during `HOLD` prediction and
+resume only on a direct accepted measurement. Source motor angle/rate limits,
+hard pulses and car feedforward are intentionally not ported because they are
+MCU responsibilities. This backend requires conservative actuator-disabled
+sign checks and K230/MCU hardware retuning before closed-loop use.
+
+LCD feedback line prefixes identify `PID` or `REF`; reference mode additionally
+shows its profile, angle-equivalent correction, D scale, breakaway bias and trim.
+PC debug exposes the same backend-specific values.
 
 The bottom LCD panel provides `Kp/Kd/Ki` `-` and `+` buttons. Each distinct
 press changes one gain by `0.1`; holding or moving a finger does not repeat.

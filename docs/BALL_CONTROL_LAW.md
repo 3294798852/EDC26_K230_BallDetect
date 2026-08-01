@@ -9,7 +9,7 @@ angle, and it does not calculate a pipe-angle, PWM or motor command.
 
 ```text
 K230: preset/MCU x_ref + image -> tracked/calibrated x, v, a
-      -> e=x-x_ref -> filtered PI-D -> a_fb
+      -> e=x-x_ref -> selected feedback backend -> a_fb
 MCU:  car feedforward + a_fb -> plant inversion -> angle inner loop
 ```
 
@@ -85,19 +85,37 @@ limits.
 Changing the reference preserves the current integral correction. A full
 runtime/filter reset clears that correction together with the filtered state.
 
-K230 calculates a continuous feedback-equivalent ball acceleration:
+## Selectable control backends
+
+`CONTROL_BACKEND` in `main.py` selects one of two implementations behind the
+same `update(state, candidate, now_ms)` interface:
+
+- `pid` is the established filtered physical-unit PI-D algorithm and remains
+  the default.
+- `reference_profile` is a K230/MicroPython port of the supplied upper-computer
+  balance-ball feedback algorithm.
+
+Both backends receive the same calibrated state, validity state and constant
+`x_ref`; both pass through the common output low-pass filter, dither option,
+`+/-140 cm/s2` clamp, snapshot and schema-6 encoder. Selecting a backend does
+not alter detector/tracker behavior or the UART frame. In reference mode,
+`FEEDBACK_SATURATED` also reports its internal P/dynamic-angle limit, even when
+the resulting acceleration remains below the common clamp.
+
+### Backend 1: physical-unit PI-D
+
+The `pid` backend calculates a continuous feedback-equivalent ball acceleration:
 
 ```text
 e = x - x_ref
 e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
-e_db = Db(e_f, 0.10)
-Ufric = -20 * clamp(e_db / 0.20, -1, +1)
-if e_f*v_db < 0 and I != 0:
-    I = move_toward_zero(I, 20*abs(v_db)*dt)
-else:
-    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
-a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
-a_fb = Sat140(LPF(a_raw, 25 ms))
+r = clamp(1 - abs(e_f)/5, 0, 1) when scheduling is enabled, else 0
+Kp_eff = Kp * (1 + 2*r)
+Kd_eff = Kd * (1 + 4*r)
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
+a_fb = Sat140(LPF(a_raw, 25 ms) + n)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
@@ -108,8 +126,8 @@ Kp = 8.0  1/s^2
 Kd = 12.0  1/s
 Ki = 12.0  1/s^3
 Ka = 0.0  dimensionless
-|Ufric| <= 20 cm/s^2
 |I| <= 80 cm/s^2
+|n| <= 5 cm/s^2
 |a_fb| <= 140 cm/s^2
 ```
 
@@ -118,34 +136,91 @@ steps. Each press triggers once; values take effect immediately and are not
 saved across reboot. A touch fault is reported on LCD/PC debug and does not stop
 camera, control or UART processing.
 
+`FEEDBACK_PD_SCHEDULE_ENABLED` enables a PID-only linear near-target schedule.
+At `|e_f| >= FEEDBACK_PD_SCHEDULE_RADIUS_CM` (default 5 cm), effective gains
+equal the touch-adjusted base gains. Toward zero error, P rises continuously to
+`FEEDBACK_PD_SCHEDULE_KP_MAX_SCALE=3` and D to
+`FEEDBACK_PD_SCHEDULE_KD_MAX_SCALE=5`. The schedule uses filtered physical
+centimeters, so it is independent of image distortion and detector backend.
+Soft deadbands remain unchanged and prevent nonzero feedback at a fully settled
+state. Disabling the switch restores constant P/D gains. The reference backend
+forces this common switch off because its own approach-dependent D profile is
+already part of that algorithm.
+
 UART publishes the tracked physical `x/v/a` before the controller's additional
 25/50 ms position/velocity filters and soft deadbands. The controller applies
 the first `0.10 cm` of position error and `0.35 cm/s` of velocity as continuous
 soft deadbands. Only when both filtered values are inside their deadbands is the
 dynamic feedback considered settled.
 
-`Ufric` is a continuous bounded approximation of static-friction breakaway
-compensation. It is zero inside the position soft deadband, grows linearly over
-the next `0.20 cm`, and is then limited to `20 cm/s2`. It has no motion-state
-switch and changes sign continuously through the reference. The configured
-magnitude should be about 70--85% of the measured actuator command required to
-start the ball, so it assists breakaway without driving a limit cycle alone.
+The integral correction `I` estimates a constant disturbance such as fixed
+vehicle/pipe tilt. It integrates at most `+/-1 cm` of soft-deadband position
+error, leaks toward zero at `0.15/s`, and is bounded to `+/-80 cm/s2`. It holds
+during bounded prediction and when both position and velocity are settled. An
+update that would push the total feedback farther into the `140 cm/s2` output
+limit is rejected (conditional anti-windup). Invalid feedback or a full
+loss/filter reset clears the integral and filtered control state. The LCD and
+PC debug output show the current integral correction and state.
 
-The integral correction `I` estimates the remaining constant disturbance such
-as fixed vehicle/pipe tilt. It integrates at most `+/-1 cm` of soft-deadband
-position error, has no default leakage, and is bounded to `+/-80 cm/s2`. It
-holds during bounded prediction and when both position and velocity are
-settled. When filtered velocity is toward the reference (`e_f*v_db < 0`), the
-integral moves toward zero at `20*|v_db| cm/s3`; equivalently, each centimeter
-of actual return travel removes at most `20 cm/s2`. The velocity soft deadband
-prevents stationary tracking noise from eroding the correction, and each update
-is capped at zero so it cannot reverse the integral sign. LCD/PC state is
-`UNWIND` while this path is active. An accumulating update that would push the
-combined PD, `Ufric` and integral output
-farther into the `140 cm/s2` limit is rejected (conditional anti-windup).
-Invalid feedback or a full loss/filter reset clears the integral and filtered
-control state. LCD shows `F` for `Ufric`; LCD and PC debug show `I` and its
-state.
+The optional `n` term is zero-mean uniform feedback dither for overcoming
+static friction. `FEEDBACK_DITHER_ENABLED` enables it and
+`FEEDBACK_DITHER_AMPLITUDE_CM_S2` sets its symmetric bound, defaulting to
+`+/-5 cm/s2`. Each random magnitude is held for two valid frames, while its
+sign flips every valid `DETECT/HOLD` frame. Adjacent valid samples are therefore
+equal and opposite within each pair, and direction still alternates across pair
+boundaries. The term is applied after the 25 ms output filter and before the
+final `+/-140 cm/s2` clamp, so the filter does not attenuate it and saturation
+remains explicit. `LOST` output remains zero and does not consume a sign step;
+the next valid frame continues the alternation. The generator is a fixed-memory
+32-bit integer xorshift implementation;
+it adds constant-time work and no allocation or external module dependency.
+Disabling the option exactly restores the deterministic PI-D output path.
+
+### Backend 2: supplied reference profile
+
+The source controller works in pixels and produces a pipe-angle correction.
+The port keeps source-domain parameters in `REFERENCE_CONTROL_SETTINGS` and
+converts them once at construction:
+
+```text
+s_px = 383 px / 25 cm = 15.32 px/cm
+e_src = -(x - x_ref) * s_px
+v_src = v * s_px
+gain_cm = gain_src * s_px * (5/7)*g*pi/180
+a(theta) = (5/7)*g*sin(theta), g=980.665 cm/s2
+```
+
+The leading minus sign converts this project's `x-x_ref` convention to the
+source controller's `target-measurement` convention. A positive physical
+displacement therefore still produces negative restoring acceleration. The
+final `sin` conversion is used instead of its small-angle approximation when
+forming the output.
+
+The rolling profile computes bounded P/I/D angle terms. When the ball moves
+toward the reference, D scale is `0.2` outside 30 source pixels, interpolates
+linearly from `0.2` to `1.0` over 30 to 8 pixels, and is full inside 8 pixels.
+Motion away from the reference always uses full D damping. Integral action is
+allowed only inside the configured error and velocity gates.
+
+After 0.35 s of direct low-speed observations, the backend selects a stronger
+stationary P profile. If error also exceeds the configured threshold, a bounded
+`3..5 deg` breakaway bias ramps toward the target. The separate slow trim learns
+a persistent low-speed offset up to `+/-4 deg`. These conservative defaults come
+from the reference implementation's reusable class defaults; its production
+`18..26 deg` motor-specific boost is deliberately not copied into the K230
+acceleration contract. During `HOLD`, profile state, integral, trim and
+breakaway bias freeze rather than learning from extrapolated data.
+
+The source project's car feedforward, motor-neutral angle, command-rate limiter,
+endpoint handling, hard pulse, motor feedback and actuator limits are not part
+of this backend. Those functions remain on the MCU. `reference_profile` still
+publishes only `a_fb`, never a servo or pipe-angle command.
+
+LCD and PC debug identify the selected backend. Reference diagnostics include
+`ROLLING/STATIONARY/BREAKAWAY`, angle correction, D scale, breakaway angle, trim
+angle and whether adaptation is frozen. Before enabling an actuator, verify
+feedback sign with the plant constrained and retune the source-domain settings
+for this camera, pipe friction and MCU angle loop.
 
 The `80 cm/s2` integral limit corresponds to roughly `6.6 deg` of static
 pipe-angle authority under the documented `5/7*g` rolling model. Larger
@@ -153,11 +228,10 @@ installation errors should be fixed mechanically rather than hidden by raising
 this limit. `a` remains a bounded low-pass velocity difference for diagnostics;
 `Ka=0` by default because camera-derived acceleration is noise-sensitive.
 
-The tracker still reports `QUIET/PENDING/MOVING` for diagnostics, but those
-labels do not switch the PI-D equation or its derivative term. The same fixed
-filters and equation run on every valid frame, avoiding control discontinuities
-when the tracker's motion classification changes. Schema 6 remains exactly 64
-bytes.
+The tracker still reports `QUIET/PENDING/MOVING` for diagnostics. Those labels
+do not switch the default PI-D equation; the reference backend instead owns its
+profile state using physical position/velocity and measurement freshness.
+Schema 6 remains exactly 64 bytes.
 
 The reference changes only the position-error term. UART still publishes the
 absolute calibrated `x` and continues to publish absolute `v/a`. Schema 6 also
@@ -263,13 +337,10 @@ the MCU has the information required for plant inversion and safety arbitration.
 4. Start with `Ki=0` and tune `Kp/Kd` for fast, damped return. Then raise `Ki`
    gradually until a constant installation tilt is rejected without slow
    oscillation. The touch panel changes all three gains live in `0.1` steps.
-5. Measure the smallest sustained command that starts a stationary ball and set
-   breakaway magnitude to about 70--85% of it. If small-error oscillation
-   appears, reduce breakaway magnitude first; if the ball still sticks, raise it
-   gradually. If integral compensation overshoots, reduce `Ki` before changing
-   the `+/-80 cm/s2` limit. If `UNWIND` removes correction too early or too
-   slowly, reduce or raise `FEEDBACK_INTEGRAL_UNWIND_GAIN_S2`; keep `Ka=0`
-   unless acceleration feedback proves useful without noise.
+5. If integral compensation overshoots, reduce `Ki` before changing the
+   `+/-80 cm/s2` limit or leak rate. If a removed tilt leaves a long opposite
+   offset, increase leak only after checking feedback sign and actuator dead
+   zone. Keep `Ka=0` unless acceleration feedback proves useful without noise.
 6. With a static ball, verify the screen remains mostly `MQ`; an occasional
    `MP1W` or `MP1C` must return without creating a velocity/feedback spike.
 7. On the MCU, distinguish `DETECT`, bounded `HOLD`, and `LOST` from the flag

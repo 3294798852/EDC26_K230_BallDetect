@@ -151,6 +151,10 @@ Correction is timestamped at camera capture completion and the state is then
 advanced only through the measured Hough processing latency before UART
 publication. Axial response becomes fast when prediction innovation grows;
 cross-pipe motion and apparent radius changes are strongly suppressed.
+The current low-lag profile blends axial position gain from `0.40` to `0.96`
+and reaches the fast value at `0.75 px`; normal/fast velocity gains are
+`0.50/0.90`. Pending reliable/ambiguous measurements use `0.24/0.18` position
+gain, while the existing two/three-frame motion confirmation remains intact.
 
 The screen updates near camera rate. Orange shows the selected raw circle box;
 cyan shows the filtered center with the slowly tracked diameter. If orange and

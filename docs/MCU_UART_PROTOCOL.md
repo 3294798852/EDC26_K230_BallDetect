@@ -119,33 +119,55 @@ All multibyte fields are little-endian. CRC16-CCITT-FALSE uses polynomial
 | 40..41 | 54..55 | 2 | `u16` | reference state/source flags |
 | 42..47 | 56..61 | 6 | bytes | reserved extension; schema 6 requires all zero |
 
-The raw feedback target is
+With `CONTROL_BACKEND="pid"`, the raw feedback target is
 
 ```text
 e = x - x_ref
 e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
-e_db = Db(e_f, 0.10)
-Ufric = -20 * clamp(e_db / 0.20, -1, +1)
-if e_f*v_db < 0 and I != 0:
-    I = move_toward_zero(I, 20*abs(v_db)*dt)
-else:
-    I = clamp(I - Ki*clamp(e_db, +/-1.0)*dt, +/-80)
-a_raw = -(Kp*e_db + Kd*Db(v_f, 0.35) + Ka*a) + Ufric + I
-a_fb = clamp(LPF(a_raw, 25 ms), +/-140)
+r = clamp(1 - abs(e_f)/5, 0, 1) when PID scheduling is enabled, else 0
+Kp_eff = Kp * (1 + 2*r)
+Kd_eff = Kd * (1 + 4*r)
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
+a_fb = clamp(LPF(a_raw, 25 ms) + n, +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
 ```
 
 Default gains are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. `I` is bounded to
-`+/-80 cm/s2`, has no default leakage, uses conditional anti-windup, holds on
-predicted frames and resets on full loss/filter reset. During motion toward the
-reference it moves toward zero by `20*|v_db|*dt`, without crossing zero.
-`Ufric` is continuous,
-ramps over `0.20 cm` beyond the position deadband and is bounded to
-`+/-20 cm/s2`. Final `a_fb` is bounded to `+/-140 cm/s2`.
+`+/-80 cm/s2`, leaks at `0.15/s`, uses conditional anti-windup, holds on
+predicted frames and resets on full loss/filter reset. Final `a_fb` is bounded
+to `+/-140 cm/s2`. With dither enabled by default, `n` alternates sign on every
+valid `DETECT/HOLD` frame and is bounded to `+/-5 cm/s2`. Each random magnitude
+is reused for one positive/negative pair. It is zero for `LOST`, which does not
+advance the alternation. The UART `a_fb` field already contains this dither and
+the MCU must not add it again. Set `FEEDBACK_DITHER_ENABLED=False` on K230 to
+disable it.
 The LCD can change `Kp/Kd/Ki` live in `0.1` steps. Schema 6 continues to carry
-the applied `Kp/Kd/Ka` and complete final `a_fb`; it has no `Ki` field and the
-reserved bytes remain zero. The MCU must not calculate or add the PI-D term a
-second time.
+the applied base `Kp/Kd/Ka` and complete final `a_fb`; it has no `Ki`, effective
+gain or schedule field and the reserved bytes remain zero. When enabled, the
+K230-only schedule raises effective P/D linearly inside 5 cm to at most `3x/5x`.
+The MCU must consume the complete `a_fb` and must not calculate or add the PI-D
+term a second time.
+
+With `CONTROL_BACKEND="reference_profile"`, the same field carries the final
+output of the ported source controller. Its original `383 px` axis is mapped to
+the calibrated `25 cm` pipe (`15.32 px/cm`), and its bounded pipe-angle
+correction is converted to equivalent solid-ball acceleration using
+`a=(5/7)*980.665*sin(theta)` cm/s2. It schedules D action during target approach,
+uses rolling/stationary/breakaway profiles and learns a bounded slow trim. The
+MCU frame decoder and scaling do not change. The transmitted `Kp/Kd/Ka` values
+are the active backend's base physical-unit-equivalent gains; scheduled D,
+profile P, breakaway and trim state cannot be reconstructed from those fields.
+Always consume the complete `a_fb` instead of recalculating it.
+
+Backend selection is compile-time K230 configuration and is shown on its LCD
+and PC debug output; schema 6 does not add a backend identifier. Record the
+selected backend as part of the test configuration. In either mode, vehicle
+feedforward, pipe-angle inversion, measured-angle inner loop, actuator limits
+and safety remain MCU responsibilities. In reference mode,
+`FEEDBACK_SATURATED` is also set by its internal proportional/dynamic-angle
+limit, not only by the final `+/-140 cm/s2` clamp.
 
 `x_ref` is the currently applied K230 reference, expressed as an absolute
 calibrated X coordinate in centimeters. Offsets 8/16 continue to carry absolute

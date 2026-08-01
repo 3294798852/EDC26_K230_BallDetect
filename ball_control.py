@@ -46,6 +46,8 @@ class BallStateFeedback:
     retained integral value continues to cancel a constant pipe inclination.
     """
 
+    backend_name = "pid"
+
     def __init__(
         self,
         kp=8.0,
@@ -63,10 +65,14 @@ class BallStateFeedback:
         feedback_filter_tau_s=0.025,
         integral_limit_cm_s2=80.0,
         integral_error_limit_cm=1.0,
-        integral_leak_per_s=0.0,
-        integral_unwind_gain_s2=20.0,
-        breakaway_accel_cm_s2=20.0,
-        breakaway_transition_cm=0.20,
+        integral_leak_per_s=0.15,
+        pd_schedule_enabled=False,
+        pd_schedule_radius_cm=5.0,
+        pd_schedule_kp_max_scale=3.0,
+        pd_schedule_kd_max_scale=5.0,
+        dither_enabled=False,
+        dither_amplitude_cm_s2=5.0,
+        dither_seed=0x13579BDF,
         acceleration_alpha=0.30,
         max_measured_accel_cm_s2=2000.0,
         x_calibration_mode=X_CALIBRATION_PINHOLE,
@@ -130,18 +136,35 @@ class BallStateFeedback:
             0.0,
             float(integral_leak_per_s),
         )
-        self.integral_unwind_gain_s2 = max(
-            0.0,
-            float(integral_unwind_gain_s2),
-        )
-        self.breakaway_accel_cm_s2 = max(
-            0.0,
-            float(breakaway_accel_cm_s2),
-        )
-        self.breakaway_transition_cm = max(
+        self.pd_schedule_enabled = bool(pd_schedule_enabled)
+        self.pd_schedule_radius_cm = max(
             0.01,
-            float(breakaway_transition_cm),
+            float(pd_schedule_radius_cm),
         )
+        self.pd_schedule_kp_max_scale = max(
+            1.0,
+            float(pd_schedule_kp_max_scale),
+        )
+        self.pd_schedule_kd_max_scale = max(
+            1.0,
+            float(pd_schedule_kd_max_scale),
+        )
+        self.pd_schedule_kp_scale = 1.0
+        self.pd_schedule_kd_scale = 1.0
+        self.effective_kp = self.kp
+        self.effective_kd = self.kd
+        self.dither_enabled = bool(dither_enabled)
+        self.dither_amplitude_cm_s2 = max(
+            0.0,
+            float(dither_amplitude_cm_s2),
+        )
+        self.dither_state = int(dither_seed) & 0xFFFFFFFF
+        if self.dither_state == 0:
+            self.dither_state = 0x13579BDF
+        self.dither_seeded = False
+        self.dither_sign = 1.0
+        self.dither_pair_magnitude_cm_s2 = 0.0
+        self.dither_pair_second_frame = False
         self.acceleration_alpha = _clamp(
             float(acceleration_alpha),
             0.0,
@@ -158,13 +181,11 @@ class BallStateFeedback:
         self.last_velocity_cm_s = None
         self.acceleration_cm_s2 = 0.0
         self.integral_correction_cm_s2 = 0.0
-        self.breakaway_feedback_cm_s2 = 0.0
         self.feedback_acceleration_cm_s2 = 0.0
         self.feedback_initialized = False
         self.integral_state = "RESET"
         self.integral_learning = False
         self.integral_limited = False
-        self.integral_unwind_active = False
         self.joint_deadband_active = False
 
     def set_reference_position_cm(
@@ -216,14 +237,16 @@ class BallStateFeedback:
         self.last_velocity_cm_s = None
         self.acceleration_cm_s2 = 0.0
         self.integral_correction_cm_s2 = 0.0
-        self.breakaway_feedback_cm_s2 = 0.0
         self.feedback_acceleration_cm_s2 = 0.0
         self.feedback_initialized = False
         self.integral_state = "RESET"
         self.integral_learning = False
         self.integral_limited = False
-        self.integral_unwind_active = False
         self.joint_deadband_active = False
+        self.pd_schedule_kp_scale = 1.0
+        self.pd_schedule_kd_scale = 1.0
+        self.effective_kp = self.kp
+        self.effective_kd = self.kd
 
     def _physical_state(self, state):
         position_x_cm, x_cm_per_pixel = x_position_and_scale(
@@ -284,8 +307,6 @@ class BallStateFeedback:
     def _update_integral(
         self,
         position_error_cm,
-        center_error_cm,
-        center_velocity_cm_s,
         dynamic_feedback_cm_s2,
         measurement_current,
         settled,
@@ -293,7 +314,6 @@ class BallStateFeedback:
     ):
         self.integral_learning = False
         self.integral_limited = False
-        self.integral_unwind_active = False
         if self.ki <= 0.0 or self.integral_limit_cm_s2 <= 0.0:
             self.integral_correction_cm_s2 = 0.0
             self.integral_state = "OFF"
@@ -305,42 +325,22 @@ class BallStateFeedback:
             self.integral_state = "SETTLE"
             return
 
+        bounded_error_cm = _clamp(
+            float(position_error_cm),
+            -self.integral_error_limit_cm,
+            self.integral_error_limit_cm,
+        )
+        integral_rate = -(
+            self.ki * bounded_error_cm
+            + self.integral_leak_per_s
+            * self.integral_correction_cm_s2
+        )
         previous_correction = self.integral_correction_cm_s2
-        moving_toward_reference = bool(
-            float(center_error_cm) * float(center_velocity_cm_s) < 0.0
+        proposed_correction = _clamp(
+            previous_correction + integral_rate * float(dt),
+            -self.integral_limit_cm_s2,
+            self.integral_limit_cm_s2,
         )
-        unwind_active = bool(
-            previous_correction != 0.0
-            and moving_toward_reference
-            and self.integral_unwind_gain_s2 > 0.0
-        )
-        if unwind_active:
-            unwind_amount = min(
-                abs(previous_correction),
-                self.integral_unwind_gain_s2
-                * abs(float(center_velocity_cm_s))
-                * float(dt),
-            )
-            if previous_correction < 0.0:
-                proposed_correction = previous_correction + unwind_amount
-            else:
-                proposed_correction = previous_correction - unwind_amount
-        else:
-            bounded_error_cm = _clamp(
-                float(position_error_cm),
-                -self.integral_error_limit_cm,
-                self.integral_error_limit_cm,
-            )
-            integral_rate = -(
-                self.ki * bounded_error_cm
-                + self.integral_leak_per_s
-                * previous_correction
-            )
-            proposed_correction = _clamp(
-                previous_correction + integral_rate * float(dt),
-                -self.integral_limit_cm_s2,
-                self.integral_limit_cm_s2,
-            )
         correction_delta = proposed_correction - previous_correction
         proposed_feedback = dynamic_feedback_cm_s2 + proposed_correction
         drives_positive_saturation = bool(
@@ -351,27 +351,92 @@ class BallStateFeedback:
             proposed_feedback < -self.max_feedback_accel_cm_s2
             and correction_delta < 0.0
         )
-        if (
-            not unwind_active
-            and (drives_positive_saturation or drives_negative_saturation)
-        ):
+        if drives_positive_saturation or drives_negative_saturation:
             self.integral_limited = True
             self.integral_state = "LIMIT"
             return
         if proposed_correction != previous_correction:
             self.integral_correction_cm_s2 = proposed_correction
-            if unwind_active:
-                self.integral_unwind_active = True
-                self.integral_state = "UNWIND"
-            elif abs(proposed_correction) >= self.integral_limit_cm_s2:
-                self.integral_learning = True
+            self.integral_learning = True
+            if abs(proposed_correction) >= self.integral_limit_cm_s2:
                 self.integral_limited = True
                 self.integral_state = "LIMIT"
             else:
-                self.integral_learning = True
                 self.integral_state = "TRACK"
             return
         self.integral_state = "HOLD"
+
+    def _next_dither_cm_s2(self, now_ms):
+        if not self.dither_enabled or self.dither_amplitude_cm_s2 <= 0.0:
+            return 0.0
+        if not self.dither_pair_second_frame:
+            state = self.dither_state
+            if not self.dither_seeded:
+                state = (state ^ int(now_ms)) & 0xFFFFFFFF
+                if state == 0:
+                    state = 0x13579BDF
+                self.dither_seeded = True
+            state ^= (state << 13) & 0xFFFFFFFF
+            state ^= state >> 17
+            state ^= (state << 5) & 0xFFFFFFFF
+            state &= 0xFFFFFFFF
+            self.dither_state = state
+            self.dither_pair_magnitude_cm_s2 = (
+                ((state & 0xFFFF) + 1) / 65536.0
+                * self.dither_amplitude_cm_s2
+            )
+            self.dither_pair_second_frame = True
+        else:
+            self.dither_pair_second_frame = False
+        dither_cm_s2 = (
+            self.dither_sign * self.dither_pair_magnitude_cm_s2
+        )
+        self.dither_sign = -self.dither_sign
+        return dither_cm_s2
+
+    def _compute_unconstrained_feedback(
+        self,
+        control_error_cm,
+        control_velocity_cm_s,
+        feedback_position_cm,
+        feedback_velocity_cm_s,
+        measurement_current,
+        settled,
+        dt,
+        now_ms,
+    ):
+        if self.pd_schedule_enabled:
+            proximity = _clamp(
+                1.0
+                - abs(float(control_error_cm))
+                / self.pd_schedule_radius_cm,
+                0.0,
+                1.0,
+            )
+            self.pd_schedule_kp_scale = 1.0 + proximity * (
+                self.pd_schedule_kp_max_scale - 1.0
+            )
+            self.pd_schedule_kd_scale = 1.0 + proximity * (
+                self.pd_schedule_kd_max_scale - 1.0
+            )
+        else:
+            self.pd_schedule_kp_scale = 1.0
+            self.pd_schedule_kd_scale = 1.0
+        self.effective_kp = self.kp * self.pd_schedule_kp_scale
+        self.effective_kd = self.kd * self.pd_schedule_kd_scale
+        dynamic_feedback = -(
+            self.effective_kp * feedback_position_cm
+            + self.effective_kd * feedback_velocity_cm_s
+            + self.ka * self.acceleration_cm_s2
+        )
+        self._update_integral(
+            feedback_position_cm,
+            dynamic_feedback,
+            measurement_current,
+            settled,
+            dt,
+        )
+        return dynamic_feedback + self.integral_correction_cm_s2
 
     def update(self, state, candidate, now_ms):
         now_ms = int(now_ms)
@@ -449,33 +514,15 @@ class BallStateFeedback:
             feedback_position_cm == 0.0
             and feedback_velocity_cm_s == 0.0
         )
-        dynamic_feedback = -(
-            self.kp * feedback_position_cm
-            + self.kd * feedback_velocity_cm_s
-            + self.ka * self.acceleration_cm_s2
-        )
-        self.breakaway_feedback_cm_s2 = -(
-            self.breakaway_accel_cm_s2
-            * _clamp(
-                feedback_position_cm / self.breakaway_transition_cm,
-                -1.0,
-                1.0,
-            )
-        )
-        non_integral_feedback = (
-            dynamic_feedback + self.breakaway_feedback_cm_s2
-        )
-        self._update_integral(
-            feedback_position_cm,
+        unconstrained_feedback = self._compute_unconstrained_feedback(
             control_error_cm,
+            control_velocity_cm_s,
+            feedback_position_cm,
             feedback_velocity_cm_s,
-            non_integral_feedback,
             measurement_current,
             self.joint_deadband_active,
             dt,
-        )
-        unconstrained_feedback = (
-            non_integral_feedback + self.integral_correction_cm_s2
+            now_ms,
         )
         if not self.feedback_initialized:
             self.feedback_acceleration_cm_s2 = unconstrained_feedback
@@ -485,7 +532,10 @@ class BallStateFeedback:
             self.feedback_acceleration_cm_s2 += output_alpha * (
                 unconstrained_feedback - self.feedback_acceleration_cm_s2
             )
-        stabilized_feedback = self.feedback_acceleration_cm_s2
+        feedback_dither_cm_s2 = self._next_dither_cm_s2(now_ms)
+        stabilized_feedback = (
+            self.feedback_acceleration_cm_s2 + feedback_dither_cm_s2
+        )
         feedback_accel = _clamp(
             stabilized_feedback,
             -self.max_feedback_accel_cm_s2,
@@ -503,6 +553,7 @@ class BallStateFeedback:
             str(state.get("motion_state", "?")),
             control_error_cm,
             feedback_velocity_cm_s,
+            feedback_dither_cm_s2,
         )
 
     def _snapshot(
@@ -518,6 +569,7 @@ class BallStateFeedback:
         motion_state="?",
         control_error_cm=0.0,
         control_velocity_cm_s=0.0,
+        feedback_dither_cm_s2=0.0,
     ):
         position_error_cm = 0.0
         if feedback_valid:
@@ -546,19 +598,24 @@ class BallStateFeedback:
             "joint_deadband_active": bool(self.joint_deadband_active),
             "feedback_valid": bool(feedback_valid),
             "feedback_saturated": bool(feedback_saturated),
+            "feedback_dither_cm_s2": float(feedback_dither_cm_s2),
+            "feedback_dither_enabled": bool(self.dither_enabled),
+            "feedback_dither_amplitude_cm_s2": float(
+                self.dither_amplitude_cm_s2
+            ),
+            "control_backend": str(self.backend_name),
             "calibration_valid": bool(self.calibration_valid),
             "center_cm_per_pixel": float(self.center_cm_per_pixel),
             "kp": float(self.kp),
             "kd": float(self.kd),
             "ka": float(self.ka),
             "ki": float(self.ki),
-            "breakaway_feedback_cm_s2": float(
-                self.breakaway_feedback_cm_s2
-            ),
-            "breakaway_accel_cm_s2": float(self.breakaway_accel_cm_s2),
-            "breakaway_transition_cm": float(
-                self.breakaway_transition_cm
-            ),
+            "effective_kp": float(self.effective_kp),
+            "effective_kd": float(self.effective_kd),
+            "pd_schedule_enabled": bool(self.pd_schedule_enabled),
+            "pd_schedule_radius_cm": float(self.pd_schedule_radius_cm),
+            "pd_schedule_kp_scale": float(self.pd_schedule_kp_scale),
+            "pd_schedule_kd_scale": float(self.pd_schedule_kd_scale),
             "steady_correction_cm_s2": float(
                 self.integral_correction_cm_s2
             ),
@@ -567,9 +624,7 @@ class BallStateFeedback:
             ),
             "steady_correction_capture_count": 0,
             "steady_correction_capture_armed": False,
-            "steady_correction_unwind_active": bool(
-                self.integral_unwind_active
-            ),
+            "steady_correction_unwind_active": False,
             "steady_correction_enabled": bool(
                 self.ki > 0.0 and self.integral_limit_cm_s2 > 0.0
             ),
@@ -580,8 +635,5 @@ class BallStateFeedback:
             "steady_correction_limited": bool(self.integral_limited),
             "steady_correction_dwell_ms": 0,
             "steady_correction_state": str(self.integral_state),
-            "integral_unwind_gain_s2": float(
-                self.integral_unwind_gain_s2
-            ),
             "compute_ms": 0,
         }

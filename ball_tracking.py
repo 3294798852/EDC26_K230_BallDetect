@@ -477,6 +477,10 @@ class PipeMotionFilter:
         )
 
     @staticmethod
+    def _acquisition_priority(candidate):
+        return int(candidate.get("acquisition_priority", 0))
+
+    @staticmethod
     def _highest_confidence(candidates):
         best = None
         for candidate in candidates:
@@ -484,8 +488,14 @@ class PipeMotionFilter:
                 continue
             if (
                 best is None
-                or float(candidate.get("confidence", 0.0))
-                > float(best.get("confidence", 0.0))
+                or PipeMotionFilter._acquisition_priority(candidate)
+                < PipeMotionFilter._acquisition_priority(best)
+                or (
+                    PipeMotionFilter._acquisition_priority(candidate)
+                    == PipeMotionFilter._acquisition_priority(best)
+                    and float(candidate.get("confidence", 0.0))
+                    > float(best.get("confidence", 0.0))
+                )
             ):
                 best = candidate
         return best
@@ -509,8 +519,14 @@ class PipeMotionFilter:
                 continue
             if (
                 best is None
-                or self._acquisition_score(candidate)
-                > self._acquisition_score(best)
+                or self._acquisition_priority(candidate)
+                < self._acquisition_priority(best)
+                or (
+                    self._acquisition_priority(candidate)
+                    == self._acquisition_priority(best)
+                    and self._acquisition_score(candidate)
+                    > self._acquisition_score(best)
+                )
             ):
                 best = candidate
         return best

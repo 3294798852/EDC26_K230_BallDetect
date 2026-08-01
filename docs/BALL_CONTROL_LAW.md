@@ -85,18 +85,27 @@ limits.
 Changing the reference preserves the current integral correction. A full
 runtime/filter reset clears that correction together with the filtered state.
 
+This reference path is shared by all three control backends. `pid` applies the
+soft-deadband PI-D terms to `x-x_ref`; `reference_profile` converts that same
+error to its source-pixel sign convention; `cascade_pid` converts the same
+soft-deadband error into `v_ref`. The `0.0 cm` constant in `main.py` is only the
+boot preset, not a hard-coded control origin. A valid UART command immediately
+replaces it for the active backend, and every subsequent state frame echoes the
+applied nonzero `x_ref` and corresponding `e=x-x_ref`.
+
 ## Selectable control backends
 
-`CONTROL_BACKEND` in `main.py` selects one of two implementations behind the
+`CONTROL_BACKEND` in `main.py` selects one of three implementations behind the
 same `update(state, candidate, now_ms)` interface:
 
 - `pid` is the established filtered physical-unit PI-D algorithm and remains
   the default.
 - `reference_profile` is a K230/MicroPython port of the supplied upper-computer
   balance-ball feedback algorithm.
+- `cascade_pid` is an independent physical-unit position/velocity cascade.
 
-Both backends receive the same calibrated state, validity state and constant
-`x_ref`; both pass through the common output low-pass filter, dither option,
+All backends receive the same calibrated state, validity state and constant
+`x_ref`; all pass through the common output low-pass filter, dither option,
 `+/-140 cm/s2` clamp, snapshot and schema-6 encoder. Selecting a backend does
 not alter detector/tracker behavior or the UART frame. In reference mode,
 `FEEDBACK_SATURATED` also reports its internal P/dynamic-angle limit, even when
@@ -112,8 +121,8 @@ e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
 r = clamp(1 - abs(e_f)/5, 0, 1) when scheduling is enabled, else 0
 Kp_eff = Kp * (1 + 2*r)
 Kd_eff = Kd * (1 + 4*r)
-I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
-a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.30), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.30) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
 n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
 a_fb = Sat140(LPF(a_raw, 25 ms) + n)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
@@ -149,7 +158,7 @@ already part of that algorithm.
 
 UART publishes the tracked physical `x/v/a` before the controller's additional
 25/50 ms position/velocity filters and soft deadbands. The controller applies
-the first `0.10 cm` of position error and `0.35 cm/s` of velocity as continuous
+the first `0.30 cm` of position error and `0.35 cm/s` of velocity as continuous
 soft deadbands. Only when both filtered values are inside their deadbands is the
 dynamic feedback considered settled.
 
@@ -165,7 +174,8 @@ PC debug output show the current integral correction and state.
 The optional `n` term is zero-mean uniform feedback dither for overcoming
 static friction. `FEEDBACK_DITHER_ENABLED` enables it and
 `FEEDBACK_DITHER_AMPLITUDE_CM_S2` sets its symmetric bound, defaulting to
-`+/-5 cm/s2`. Each random magnitude is held for two valid frames, while its
+`+/-5 cm/s2`. It defaults off for low-jitter one-centimeter holding. When
+explicitly enabled, each random magnitude is held for two valid frames, while its
 sign flips every valid `DETECT/HOLD` frame. Adjacent valid samples are therefore
 equal and opposite within each pair, and direction still alternates across pair
 boundaries. The term is applied after the 25 ms output filter and before the
@@ -221,6 +231,58 @@ LCD and PC debug identify the selected backend. Reference diagnostics include
 angle and whether adaptation is frozen. Before enabling an actuator, verify
 feedback sign with the plant constrained and retune the source-domain settings
 for this camera, pipe friction and MCU angle loop.
+
+### Backend 3: position/velocity cascade PID
+
+The cascade backend is a separate class in `ball_control_backends.py`; it does
+not alter the established PI-D or reference-profile equations. Its outer loop
+converts position error into a bounded velocity target, while its inner loop
+converts velocity error into the same acceleration-feedback contract:
+
+```text
+e_x = Db(x - x_ref, 0.30 cm)
+v_ref = clamp(-Kx * e_x, +/-v_ref_max)
+e_v = v_ref - Db(v, 0.35 cm/s)
+I_v = clamp(I_v + (Ki_v*clamp(e_v, +/-e_v_int_max)
+                    - leak*I_v)*dt, +/-I_v_max)
+a_raw = Kv*e_v + I_v - Kdv*a
+a_fb = clamp(LPF(a_raw, 25 ms) + n, +/-140 cm/s2)
+```
+
+Defaults in `CASCADE_CONTROL_SETTINGS` are `Kx=0.55/s`, `v_ref_max=6 cm/s`,
+`Kv=12/s`, `Ki_v=18/s2`, `Kdv=0`, `e_v_int_max=4 cm/s`, `I_v_max=80 cm/s2`
+and integral leak `0.05/s`. The small-signal proportional stiffness is roughly
+`Kx*Kv=6.6/s2`, slightly softer than the unscheduled base PID, while the velocity target
+limit prevents the commanded approach speed from growing without bound at a
+large displacement. The conservative inner integral reduces repeated small
+crossings near the target. The measured-acceleration derivative avoids derivative
+kick on a position-reference step; it remains disabled by default because
+camera-derived acceleration is noisy.
+
+The inner integral uses conditional anti-windup, freezes on `HOLD`, and clears
+on full loss/reset. It learns only outside the `0.30 cm` position deadband.
+Inside that band it holds the learned disturbance correction unless velocity
+error opposes it; opposing error unloads it at `4x` rate and a zero crossing is
+clamped to zero before any opposite correction can build. This gives fast
+withdrawal without integral sign chatter. It supplies the steady disturbance
+correction needed to make the velocity error zero. Cascade-only
+position/velocity/output filter constants are `15/35/10 ms`; the established
+PID and reference-profile filter settings remain unchanged. The common dither switch, final
+limit, validity handling and UART encoder remain unchanged. The touch panel
+labels its three live gains `Kx/Kv/Ki`; `Kdv` is changed only through the
+explicit configuration.
+
+Only the outer proportional term is used intentionally. Adding another
+position integral would duplicate the velocity-loop integral and produce two
+slow adaptive states; an outer derivative would duplicate measured velocity.
+The P/PI-D split is therefore the conventional low-order position/velocity
+cascade and keeps tuning deterministic.
+
+In schema 6, the existing `v_ref` field carries the live bounded cascade target
+instead of zero. The gain fields carry `Kx`, `Kv` and `Kdv` in the existing
+`Kp/Kd/Ka` slots; there is still no encoded inner `Ki`. The frame has no backend
+identifier, so the MCU/test log must record the configured backend and consume
+the complete `a_fb` instead of attempting to reconstruct it.
 
 The `80 cm/s2` integral limit corresponds to roughly `6.6 deg` of static
 pipe-angle authority under the documented `5/7*g` rolling model. Larger

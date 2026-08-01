@@ -70,6 +70,12 @@ class EdgeHoughCircleDetector:
         cluster_radius_tolerance_px=2.0,
         tracked_radius_tolerance_px=3.0,
         ambiguous_spread_radius_factor=0.65,
+        position_filter_enabled=False,
+        position_center_x_px=160.0,
+        position_center_y_px=160.0,
+        position_y_half_height_px=16.0,
+        position_x_preferred_half_width_px=120.0,
+        position_x_hard_half_width_px=145.0,
     ):
         if cv_lite is None:
             raise RuntimeError(
@@ -133,6 +139,27 @@ class EdgeHoughCircleDetector:
             0.10,
             float(ambiguous_spread_radius_factor),
         )
+        self.position_filter_enabled = bool(position_filter_enabled)
+        self.position_center_x_px = float(position_center_x_px)
+        self.position_center_y_px = float(position_center_y_px)
+        self.position_y_half_height_px = max(
+            0.0,
+            float(position_y_half_height_px),
+        )
+        self.position_x_preferred_half_width_px = max(
+            0.0,
+            float(position_x_preferred_half_width_px),
+        )
+        self.position_x_hard_half_width_px = max(
+            0.0,
+            float(position_x_hard_half_width_px),
+        )
+        if (
+            self.position_filter_enabled
+            and self.position_x_preferred_half_width_px
+            > self.position_x_hard_half_width_px
+        ):
+            raise ValueError("Hough preferred X range exceeds hard range")
         self.roi = self._build_roi()
         self.roi_x = int(self.roi[0])
         self.roi_y = int(self.roi[1])
@@ -153,6 +180,9 @@ class EdgeHoughCircleDetector:
         self.selected_radius_spread_px = 0.0
         self.selected_measurement_quality = 0.0
         self.selected_measurement_ambiguous = False
+        self.position_rejected_count = 0
+        self.position_preferred_count = 0
+        self.position_outer_count = 0
         self.hint_active = False
         self.last_warning = None
         self.roi_shape_checked = False
@@ -215,6 +245,20 @@ class EdgeHoughCircleDetector:
         lateral = -relative_x * self.axis_y + relative_y * self.axis_x
         return along, lateral
 
+    def _position_region(self, center_x, center_y):
+        if not self.position_filter_enabled:
+            return 0
+        offset_x = abs(float(center_x) - self.position_center_x_px)
+        offset_y = abs(float(center_y) - self.position_center_y_px)
+        if (
+            offset_y > self.position_y_half_height_px
+            or offset_x > self.position_x_hard_half_width_px
+        ):
+            return None
+        if offset_x <= self.position_x_preferred_half_width_px:
+            return 0
+        return 1
+
     def _hint_values(self, tracking_hint):
         if tracking_hint is None:
             return None
@@ -243,6 +287,9 @@ class EdgeHoughCircleDetector:
         center_y = float(center_y)
         radius = float(radius)
         if radius < self.min_radius_px or radius > self.max_radius_px:
+            return None
+        position_region = self._position_region(center_x, center_y)
+        if position_region is None:
             return None
         along, lateral = self._axis_coordinates(center_x, center_y)
         center_lateral_limit = self.axis_center_limit_px
@@ -346,7 +393,21 @@ class EdgeHoughCircleDetector:
             "source_index": int(source_index),
             "tracked_candidate": tracked_candidate,
             "expected_radius": expected_radius,
+            "acquisition_priority": int(position_region),
         }
+
+    def _selected_sort_key(self, candidate):
+        score = float(candidate.get(
+            "acquisition_score",
+            candidate.get("confidence", 0.0),
+        ))
+        if not self.position_filter_enabled:
+            return (0, 0, -score)
+        return (
+            0 if candidate.get("tracked_candidate") else 1,
+            int(candidate.get("acquisition_priority", 0)),
+            -score,
+        )
 
     def _cluster_match_distance(self, cluster, candidate):
         seed = cluster["seed"]
@@ -491,6 +552,9 @@ class EdgeHoughCircleDetector:
         self.selected_radius_spread_px = 0.0
         self.selected_measurement_quality = 0.0
         self.selected_measurement_ambiguous = False
+        self.position_rejected_count = 0
+        self.position_preferred_count = 0
+        self.position_outer_count = 0
         self.last_warning = None
         hint_values = self._hint_values(tracking_hint)
         self.hint_active = hint_values is not None
@@ -553,9 +617,14 @@ class EdgeHoughCircleDetector:
         candidates = []
         for circle_index in range(process_count):
             offset = circle_index * 3
+            center_x = float(circles[offset]) + self.roi_x
+            center_y = float(circles[offset + 1]) + self.roi_y
+            if self._position_region(center_x, center_y) is None:
+                self.position_rejected_count += 1
+                continue
             candidate = self._candidate(
-                float(circles[offset]) + self.roi_x,
-                float(circles[offset + 1]) + self.roi_y,
+                center_x,
+                center_y,
                 circles[offset + 2],
                 hint_values,
                 circle_index,
@@ -575,13 +644,13 @@ class EdgeHoughCircleDetector:
             )
             if fused is not None:
                 selected.append(fused)
-        selected.sort(
-            key=lambda item: item.get(
-                "acquisition_score",
-                item["confidence"],
-            ),
-            reverse=True,
-        )
+        if self.position_filter_enabled:
+            for candidate in selected:
+                if int(candidate.get("acquisition_priority", 0)) == 0:
+                    self.position_preferred_count += 1
+                else:
+                    self.position_outer_count += 1
+        selected.sort(key=self._selected_sort_key)
         if len(selected) > self.max_candidates:
             selected = selected[:self.max_candidates]
         self.last_detection_count = len(selected)
@@ -623,10 +692,17 @@ class EdgeHoughCircleDetector:
             measurement_ambiguous = bool(
                 selected_candidate.get("measurement_ambiguous")
             )
-        text = "H{}/{}/{} S{} D{:.1f}/{:.1f} Q{:.0f}{} h{} P{}/{}".format(
+        text = (
+            "H{}/{}/{} G{}/{}/{}{} S{} D{:.1f}/{:.1f} "
+            "Q{:.0f}{} h{} P{}/{}"
+        ).format(
             int(self.last_detection_count),
             int(self.cluster_count),
             int(self.raw_circle_count),
+            int(self.position_preferred_count),
+            int(self.position_outer_count),
+            int(self.position_rejected_count),
+            "E" if self.position_filter_enabled else "-",
             int(support_count),
             float(center_spread_px),
             float(radius_spread_px),

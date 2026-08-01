@@ -131,7 +131,7 @@ except Exception as _boot_exc:
     _BOOT_IMPORT_ERROR = _boot_exc
 
 
-APP_VERSION = "proj2-1.72"
+APP_VERSION = "proj2-1.76"
 
 # Select one detector backend: yolov8n, yolov8, roi_blob, or edge_hough.
 # The generic "yolov8" artifact has no trustworthy subtype metadata.
@@ -202,6 +202,16 @@ HOUGH_CLUSTER_CENTER_FACTOR = 1.0
 HOUGH_CLUSTER_RADIUS_TOLERANCE_PX = 2.0
 HOUGH_TRACKED_RADIUS_TOLERANCE_PX = 3.0
 HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR = 0.65
+# Optional Hough-only image-position gate. Disable the master switch to bypass
+# this complete layer. Enabled: reject centers outside Y=160+/-16 or
+# X=160+/-145; during acquisition/reacquire prefer X=160+/-120 over the outer
+# 25 px end bands. Active-track association still follows predicted distance.
+HOUGH_POSITION_FILTER_ENABLED = True
+HOUGH_POSITION_CENTER_X_PX = 160.0
+HOUGH_POSITION_CENTER_Y_PX = 160.0
+HOUGH_POSITION_Y_HALF_HEIGHT_PX = 16.0
+HOUGH_POSITION_X_PREFERRED_HALF_WIDTH_PX = 120.0
+HOUGH_POSITION_X_HARD_HALF_WIDTH_PX = 145.0
 
 # Image-space pipe geometry used only by detection and pixel-domain tracking.
 # Physical conversion is isolated in ball_calibration.py after tracking.
@@ -215,18 +225,18 @@ PIPE_POSITIVE_END_Y_PX = 160.0
 # is the current physical-ruler fit; "pinhole" preserves the original model.
 X_CALIBRATION_MODE = X_CALIBRATION_MEASURED
 
-# Select "pid" for the established controller or "reference_profile" for the
-# physical-unit port of the supplied upper-computer balance-ball algorithm.
+# Select "pid", "reference_profile", or the independent position/velocity
+# "cascade_pid" backend. All publish the same physical state and acceleration.
 CONTROL_BACKEND = "pid"
 
-# Common feedback transport, validity, filtering and output limits. Both
+# Common feedback transport, validity, filtering and output limits. All
 # backends publish the same cm/s2 result and use the unchanged UART schema.
 FEEDBACK_KP = 8.0
 FEEDBACK_KD = 12.0
 FEEDBACK_KI = 12.0
 FEEDBACK_KA = 0.0
 FEEDBACK_ACCEL_LIMIT_CM_S2 = 140.0
-FEEDBACK_POSITION_DEADBAND_CM = 0.10
+FEEDBACK_POSITION_DEADBAND_CM = 0.30
 FEEDBACK_VELOCITY_DEADBAND_CM_S = 0.35
 FEEDBACK_POSITION_FILTER_TAU_S = 0.025
 FEEDBACK_VELOCITY_FILTER_TAU_S = 0.050
@@ -236,7 +246,7 @@ FEEDBACK_INTEGRAL_ERROR_LIMIT_CM = 1.0
 FEEDBACK_INTEGRAL_LEAK_PER_S = 0.15
 # PID-only near-target gain schedule. At |e| >= 5 cm the touch-adjusted base
 # gains are used. Toward e=0, Kp rises linearly to 3x and Kd to 5x. The
-# reference_profile backend has its own D schedule and ignores these settings.
+# reference_profile and cascade_pid backends force this common schedule off.
 FEEDBACK_PD_SCHEDULE_ENABLED = True
 FEEDBACK_PD_SCHEDULE_RADIUS_CM = 5.0
 FEEDBACK_PD_SCHEDULE_KP_MAX_SCALE = 3.0
@@ -244,7 +254,7 @@ FEEDBACK_PD_SCHEDULE_KD_MAX_SCALE = 5.0
 # Paired random-magnitude feedback dither used to overcome static friction.
 # Every valid frame reverses direction; each pair has equal magnitude. Disable
 # to recover the unchanged deterministic PI-D output path.
-FEEDBACK_DITHER_ENABLED = True
+FEEDBACK_DITHER_ENABLED = False
 FEEDBACK_DITHER_AMPLITUDE_CM_S2 = 5.0
 
 # Source-controller parameters remain in their documented pixel/degree units
@@ -257,7 +267,7 @@ REFERENCE_CONTROL_SETTINGS = {
     "rolling_kp_deg_per_px": 0.035,
     "rolling_ki_deg_per_px_s": 0.0,
     "rolling_kd_deg_s_per_px": 0.012,
-    "deadband_px": 3.0,
+    "deadband_cm": 0.30,
     "proportional_limit_deg": 8.0,
     "derivative_limit_deg": 5.0,
     "dynamic_tilt_limit_deg": 10.0,
@@ -286,9 +296,27 @@ REFERENCE_CONTROL_SETTINGS = {
     "trim_activation_s": 0.20,
     "trim_velocity_gate_px_s": 12.0,
 }
+# Position/velocity cascade controller. The outer position P loop produces a
+# bounded target velocity. The inner velocity PID produces feedback acceleration
+# and freezes its integral on predicted frames. These gains are independent of
+# FEEDBACK_KP/KD/KI and are used only when CONTROL_BACKEND="cascade_pid".
+CASCADE_CONTROL_SETTINGS = {
+    "position_kp_s_inv": 0.55,
+    "max_reference_velocity_cm_s": 6.0,
+    "velocity_kp_s_inv": 12.0,
+    "velocity_ki_s2_inv": 18.0,
+    "velocity_kd": 0.0,
+    "velocity_integral_limit_cm_s2": 80.0,
+    "velocity_integral_error_limit_cm_s": 4.0,
+    "velocity_integral_leak_per_s": 0.05,
+    "velocity_integral_unwind_scale": 4.0,
+    "position_filter_tau_s": 0.015,
+    "velocity_filter_tau_s": 0.035,
+    "feedback_filter_tau_s": 0.010,
+}
 # Absolute calibrated X coordinate used as the ball equilibrium origin.
-# A future validated algorithm/MCU command may call
-# BallStateFeedback.set_reference_position_cm() to update it at runtime.
+# This is only the boot preset. Every control backend inherits the same bounded
+# set_reference_position_cm() interface used by the live MCU UART command.
 FEEDBACK_REFERENCE_POSITION_CM = 0.0
 TRACK_HOLD_MAX_FRAMES = 8
 TRACK_HOLD_MAX_MS = 300
@@ -1018,6 +1046,16 @@ def _create_detector():
             ambiguous_spread_radius_factor=(
                 HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR
             ),
+            position_filter_enabled=HOUGH_POSITION_FILTER_ENABLED,
+            position_center_x_px=HOUGH_POSITION_CENTER_X_PX,
+            position_center_y_px=HOUGH_POSITION_CENTER_Y_PX,
+            position_y_half_height_px=HOUGH_POSITION_Y_HALF_HEIGHT_PX,
+            position_x_preferred_half_width_px=(
+                HOUGH_POSITION_X_PREFERRED_HALF_WIDTH_PX
+            ),
+            position_x_hard_half_width_px=(
+                HOUGH_POSITION_X_HARD_HALF_WIDTH_PX
+            ),
         )
     if config.get("native_roi"):
         return RoiDarkBlobDetector(
@@ -1315,13 +1353,21 @@ class CameraDisplay:
             8,
             panel_top + 1,
             16,
-            "PID TOUCH step=0.1 {}".format(pid_tuner.diagnostic_text()),
+            "{} TOUCH step=0.1 {}".format(
+                str(pid_tuner.controller.backend_name).upper(),
+                pid_tuner.diagnostic_text(),
+            ),
             color=(COLOR_BAD if pid_tuner.last_error is not None else COLOR_TITLE),
         )
+        labels = getattr(
+            pid_tuner.controller,
+            "touch_gain_labels",
+            ("Kp", "Kd", "Ki"),
+        )
         values = (
-            ("Kp", float(feedback.get("kp", pid_tuner.controller.kp))),
-            ("Kd", float(feedback.get("kd", pid_tuner.controller.kd))),
-            ("Ki", float(feedback.get("ki", pid_tuner.controller.ki))),
+            (labels[0], float(feedback.get("kp", pid_tuner.controller.kp))),
+            (labels[1], float(feedback.get("kd", pid_tuner.controller.kd))),
+            (labels[2], float(feedback.get("ki", pid_tuner.controller.ki))),
         )
         for row, item in enumerate(values):
             label, value = item
@@ -1519,6 +1565,22 @@ class CameraDisplay:
                 float(feedback.get("reference_breakaway_deg", 0.0)),
                 float(feedback.get("reference_trim_deg", 0.0)),
                 " HOLD" if feedback.get("reference_adaptation_frozen") else "",
+            )
+        elif feedback.get("control_backend") == "cascade_pid":
+            feedback_text = (
+                "CAS vR={:+.2f} eV={:+.2f} FB{:+.1f}/{:+.1f} "
+                "I{:+.1f} {}{}"
+            ).format(
+                float(feedback.get("reference_velocity_cm_s", 0.0)),
+                float(feedback.get("cascade_velocity_error_cm_s", 0.0)),
+                float(feedback.get("feedback_acceleration_cm_s2", 0.0)),
+                float(feedback.get(
+                    "unfiltered_feedback_acceleration_cm_s2",
+                    0.0,
+                )),
+                float(feedback.get("cascade_inner_i_cm_s2", 0.0)),
+                str(feedback.get("steady_correction_state", "?"))[:6],
+                " LIM" if feedback.get("cascade_position_limited") else "",
             )
         else:
             feedback_text = (
@@ -2021,7 +2083,8 @@ def _print_pc_debug_status(
         "q={:.2f},s={}] "
         "phys[p=({:+.2f},{:+.2f}),v=({:+.2f},{:+.2f}),aX={:+.1f},"
         "ref={:+.2f},e={:+.2f}] "
-        "ctrl[be={},e={:+.2f},v={:+.2f},db={},prof={},ang={:+.2f},"
+        "ctrl[be={},e={:+.2f},v={:+.2f},vR={:+.2f},eV={:+.2f},"
+        "db={},prof={},ang={:+.2f},"
         "D={:.2f},br={:+.2f},tr={:+.2f},freeze={}] "
         "fb[a={:+.1f},raw={:+.1f},kp={:.2f}/{:.2f},kd={:.2f}/{:.2f},ki={:.2f},"
         "ka={:.3f},I={:+.2f},N={:+.2f},is={},valid={},sat={}] "
@@ -2061,6 +2124,8 @@ def _print_pc_debug_status(
             str(feedback.get("control_backend", "?")),
             float(feedback.get("control_position_error_cm", 0.0)),
             float(feedback.get("feedback_velocity_cm_s", 0.0)),
+            float(feedback.get("reference_velocity_cm_s", 0.0)),
+            float(feedback.get("cascade_velocity_error_cm_s", 0.0)),
             "Y" if feedback.get("joint_deadband_active") else "N",
             str(feedback.get("reference_profile", "-")),
             float(feedback.get("reference_correction_deg", 0.0)),
@@ -2254,7 +2319,8 @@ def main(pc_debug=False):
                 "dither_enabled": FEEDBACK_DITHER_ENABLED,
                 "dither_amplitude_cm_s2": FEEDBACK_DITHER_AMPLITUDE_CM_S2,
             },
-            REFERENCE_CONTROL_SETTINGS,
+            reference_settings=REFERENCE_CONTROL_SETTINGS,
+            cascade_settings=CASCADE_CONTROL_SETTINGS,
         )
         stage = "uart_rx_init"
         rx = UartReferenceCommandRx(uart, feedback_filter)

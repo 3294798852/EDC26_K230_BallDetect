@@ -675,6 +675,116 @@ def _run_hough_fusion_self_test():
         assert abs(ball["radius"] - 5.3) < 0.0001
         assert ball["measurement_ambiguous"]
         assert ball["acquisition_score"] > fused[1]["acquisition_score"]
+
+        position_detector = hough_module.EdgeHoughCircleDetector(
+            position_filter_enabled=True,
+            position_center_x_px=160.0,
+            position_center_y_px=160.0,
+            position_y_half_height_px=16.0,
+            position_x_preferred_half_width_px=120.0,
+            position_x_hard_half_width_px=145.0,
+        )
+        for center_x, center_y in (
+            (15.0, 160.0),
+            (305.0, 160.0),
+            (160.0, 144.0),
+            (160.0, 176.0),
+        ):
+            assert position_detector._candidate(
+                center_x,
+                center_y,
+                5.5,
+                None,
+                0,
+            ) is not None
+        for center_x, center_y in (
+            (14.9, 160.0),
+            (305.1, 160.0),
+            (160.0, 143.9),
+            (160.0, 176.1),
+        ):
+            assert position_detector._candidate(
+                center_x,
+                center_y,
+                5.5,
+                None,
+                0,
+            ) is None
+        preferred = position_detector._candidate(
+            280.0,
+            160.0,
+            5.5,
+            None,
+            0,
+        )
+        outer = position_detector._candidate(
+            281.0,
+            160.0,
+            5.5,
+            None,
+            1,
+        )
+        assert preferred["acquisition_priority"] == 0
+        assert outer["acquisition_priority"] == 1
+        preferred["acquisition_score"] = 0.50
+        outer["acquisition_score"] = 0.99
+        sorted_candidates = [outer, preferred]
+        sorted_candidates.sort(key=position_detector._selected_sort_key)
+        assert sorted_candidates[0] is preferred
+
+        disabled_position_detector = hough_module.EdgeHoughCircleDetector(
+            position_filter_enabled=False,
+        )
+        bypass_candidate = disabled_position_detector._candidate(
+            10.0,
+            180.0,
+            5.5,
+            None,
+            0,
+        )
+        assert bypass_candidate is not None
+        bypass_candidate["acquisition_score"] = 0.99
+        lower_score_candidate = disabled_position_detector._candidate(
+            160.0,
+            160.0,
+            5.5,
+            None,
+            1,
+        )
+        lower_score_candidate["acquisition_score"] = 0.50
+        bypass_sorted = [lower_score_candidate, bypass_candidate]
+        bypass_sorted.sort(
+            key=disabled_position_detector._selected_sort_key
+        )
+        assert bypass_sorted[0] is bypass_candidate
+
+        from ball_tracking import PipeMotionFilter
+
+        acquisition_tracker = PipeMotionFilter(acquire_confirm_frames=1)
+        preferred_for_acquisition = _tracking_candidate(200.0)
+        preferred_for_acquisition["acquisition_priority"] = 0
+        preferred_for_acquisition["acquisition_score"] = 0.50
+        outer_for_acquisition = _tracking_candidate(290.0)
+        outer_for_acquisition["acquisition_priority"] = 1
+        outer_for_acquisition["acquisition_score"] = 0.99
+        assert acquisition_tracker._highest_acquisition_candidate(
+            [outer_for_acquisition, preferred_for_acquisition]
+        ) is preferred_for_acquisition
+
+        active_tracker = PipeMotionFilter(
+            acquire_confirm_frames=1,
+            fixed_axis_x=1.0,
+            fixed_axis_y=0.0,
+        )
+        active_tracker.update(_tracking_candidate(290.0), 1000)
+        tracked_outer = _tracking_candidate(291.0)
+        tracked_outer["acquisition_priority"] = 1
+        center_false = _tracking_candidate(200.0)
+        center_false["acquisition_priority"] = 0
+        assert active_tracker.select_candidate(
+            [center_false, tracked_outer],
+            1033,
+        ) is tracked_outer
     finally:
         hough_module.cv_lite = original_cv_lite
 
@@ -913,8 +1023,10 @@ def run_self_test():
 
     from ball_control import BallStateFeedback
     from ball_control_backends import (
+        CASCADE_PID_BACKEND,
         PID_BACKEND,
         REFERENCE_BACKEND,
+        CascadePidFeedback,
         ReferenceProfileFeedback,
         create_control_backend,
     )
@@ -923,7 +1035,7 @@ def run_self_test():
     assert (controller.kp, controller.kd, controller.ki, controller.ka) == (
         8.0, 12.0, 12.0, 0.0
     )
-    assert controller.position_deadband_cm == 0.10
+    assert controller.position_deadband_cm == 0.30
     assert controller.velocity_deadband_cm_s == 0.35
     assert controller.integral_limit_cm_s2 == 80.0
     assert controller.integral_leak_per_s == 0.15
@@ -1098,6 +1210,23 @@ def run_self_test():
         - direct_pid_feedback["feedback_acceleration_cm_s2"]
     ) < 0.000001
 
+    default_cascade = create_control_backend(
+        CASCADE_PID_BACKEND,
+        dict(common_control_settings),
+    )
+    assert (default_cascade.kp, default_cascade.kd, default_cascade.ki) == (
+        0.55,
+        12.0,
+        18.0,
+    )
+    assert default_cascade.ka == 0.0
+    assert default_cascade.max_reference_velocity_cm_s == 6.0
+    assert default_cascade.integral_leak_per_s == 0.05
+    assert default_cascade.velocity_integral_unwind_scale == 4.0
+    assert default_cascade.position_filter_tau_s == 0.015
+    assert default_cascade.velocity_filter_tau_s == 0.035
+    assert default_cascade.feedback_filter_tau_s == 0.010
+
     reference_backend = create_control_backend(
         REFERENCE_BACKEND,
         dict(common_control_settings),
@@ -1115,6 +1244,34 @@ def run_self_test():
     assert reference_feedback["feedback_acceleration_cm_s2"] < 0.0
     assert reference_backend._derivative_brake_scale(3.0, -1.0) == 0.20
     assert reference_backend._derivative_brake_scale(3.0, 1.0) == 1.0
+    reference_soft_deadband_backend = create_control_backend(
+        REFERENCE_BACKEND,
+        dict(common_control_settings),
+        {
+            "rolling_ki_deg_per_px_s": 0.0,
+            "rolling_kd_deg_s_per_px": 0.0,
+            "trim_enabled": False,
+        },
+    )
+    reference_soft_deadband_state = dict(active_state)
+    reference_soft_deadband_state["x"] = x_pixel_for_position_cm(
+        0.31,
+        measured_lut,
+    )
+    reference_soft_deadband_state["vx"] = 0.0
+    reference_soft_deadband_feedback = reference_soft_deadband_backend.update(
+        reference_soft_deadband_state,
+        reference_candidate,
+        3033,
+    )
+    expected_soft_error_px = (
+        -0.01 * reference_soft_deadband_backend.source_pixels_per_cm
+    )
+    expected_soft_p_deg = 0.035 * expected_soft_error_px
+    assert abs(
+        reference_soft_deadband_feedback["reference_correction_deg"]
+        - expected_soft_p_deg
+    ) < 0.001
 
     saturated_reference_backend = create_control_backend(
         REFERENCE_BACKEND,
@@ -1181,6 +1338,242 @@ def run_self_test():
     )
     assert not lost_reference_feedback["feedback_valid"]
     assert lost_reference_feedback["feedback_acceleration_cm_s2"] == 0.0
+
+    cascade_backend = create_control_backend(
+        CASCADE_PID_BACKEND,
+        dict(common_control_settings),
+        cascade_settings={
+            "position_kp_s_inv": 0.70,
+            "max_reference_velocity_cm_s": 6.0,
+            "velocity_kp_s_inv": 12.0,
+            "velocity_ki_s2_inv": 0.0,
+            "velocity_kd": 0.0,
+            "position_filter_tau_s": 0.0,
+            "velocity_filter_tau_s": 0.0,
+            "feedback_filter_tau_s": 0.0,
+        },
+    )
+    assert isinstance(cascade_backend, CascadePidFeedback)
+    assert not cascade_backend.pd_schedule_enabled
+    cascade_feedback = cascade_backend.update(
+        active_state,
+        reference_candidate,
+        5000,
+    )
+    assert cascade_feedback["control_backend"] == CASCADE_PID_BACKEND
+    assert abs(cascade_feedback["reference_velocity_cm_s"] + 0.49) < 0.01
+    assert abs(
+        cascade_feedback["feedback_acceleration_cm_s2"] + 5.88
+    ) < 0.05
+    cascade_far_state = dict(active_state)
+    cascade_far_state["x"] = x_pixel_for_position_cm(10.0, measured_lut)
+    cascade_far_feedback = cascade_backend.update(
+        cascade_far_state,
+        reference_candidate,
+        5033,
+    )
+    assert cascade_far_feedback["reference_velocity_cm_s"] == -6.0
+    assert cascade_far_feedback["cascade_position_limited"]
+    cascade_frame = encode_ball_state_frame(
+        9,
+        5033,
+        BALL_FLAG_RAW_DETECTED
+        | BALL_FLAG_MEASUREMENT_ACCEPTED
+        | BALL_FLAG_TRACK_VALID
+        | BALL_FLAG_FEEDBACK_VALID,
+        cascade_far_state,
+        reference_candidate,
+        1,
+        cascade_far_feedback,
+    )
+    cascade_decoded = decode_ball_state_frame(cascade_frame)
+    assert cascade_decoded["reference_velocity_cm_s"] == -6.0
+    assert cascade_decoded["kp"] == 0.70
+    assert cascade_decoded["kd"] == 12.0
+    assert cascade_decoded["ka"] == 0.0
+
+    cascade_integral_backend = create_control_backend(
+        CASCADE_PID_BACKEND,
+        dict(common_control_settings),
+        cascade_settings={
+            "position_kp_s_inv": 1.0,
+            "velocity_kp_s_inv": 0.0,
+            "velocity_ki_s2_inv": 10.0,
+            "velocity_kd": 0.0,
+            "velocity_integral_leak_per_s": 0.0,
+        },
+    )
+    learned_feedback = cascade_integral_backend.update(
+        active_state,
+        reference_candidate,
+        6000,
+    )
+    assert learned_feedback["cascade_inner_i_cm_s2"] < 0.0
+    learned_integral = cascade_integral_backend.integral_correction_cm_s2
+    cascade_prediction = dict(active_state)
+    cascade_prediction["measurement_accepted"] = False
+    cascade_prediction["predicted"] = True
+    cascade_prediction["missed_frames"] = 1
+    cascade_prediction["measurement_age_ms"] = 33
+    held_feedback = cascade_integral_backend.update(
+        cascade_prediction,
+        None,
+        6033,
+    )
+    assert held_feedback["feedback_valid"]
+    assert held_feedback["steady_correction_state"] == "HOLD"
+    assert (
+        cascade_integral_backend.integral_correction_cm_s2
+        == learned_integral
+    )
+    lost_cascade_feedback = cascade_integral_backend.update(
+        {"track_valid": False},
+        None,
+        6066,
+    )
+    assert not lost_cascade_feedback["feedback_valid"]
+    assert cascade_integral_backend.integral_correction_cm_s2 == 0.0
+
+    unwind_backend = create_control_backend(
+        CASCADE_PID_BACKEND,
+        dict(common_control_settings),
+        cascade_settings={
+            "velocity_kp_s_inv": 0.0,
+            "velocity_ki_s2_inv": 10.0,
+            "velocity_integral_leak_per_s": 0.0,
+            "velocity_integral_unwind_scale": 4.0,
+        },
+    )
+    unwind_backend.integral_correction_cm_s2 = 1.0
+    unwind_backend._update_velocity_integral(
+        4.0,
+        False,
+        0.0,
+        True,
+        False,
+        0.035,
+    )
+    assert unwind_backend.integral_correction_cm_s2 == 1.0
+    assert unwind_backend.integral_state == "CENTER"
+    unwind_backend._update_velocity_integral(
+        -4.0,
+        False,
+        0.0,
+        True,
+        False,
+        0.035,
+    )
+    assert unwind_backend.integral_correction_cm_s2 == 0.0
+    assert unwind_backend.integral_state == "UNWIND"
+    assert unwind_backend.cascade_integral_unwind_active
+    unwind_backend._update_velocity_integral(
+        -4.0,
+        False,
+        0.0,
+        True,
+        False,
+        0.035,
+    )
+    assert unwind_backend.integral_correction_cm_s2 == 0.0
+    assert unwind_backend.integral_state == "CENTER"
+    unwind_backend._update_velocity_integral(
+        -4.0,
+        True,
+        0.0,
+        True,
+        False,
+        0.035,
+    )
+    assert unwind_backend.integral_correction_cm_s2 < 0.0
+    assert unwind_backend.integral_state == "TRACK"
+
+    shared_reference_cm = 2.50
+    shared_reference_state = dict(active_state)
+    shared_reference_state["x"] = x_pixel_for_position_cm(
+        shared_reference_cm,
+        measured_lut,
+    )
+    shared_reference_state["vx"] = 0.0
+    shifted_reference_state = dict(shared_reference_state)
+    shifted_reference_state["x"] = x_pixel_for_position_cm(
+        shared_reference_cm + 1.0,
+        measured_lut,
+    )
+    backend_cases = (
+        (PID_BACKEND, None, None),
+        (
+            REFERENCE_BACKEND,
+            {
+                "rolling_ki_deg_per_px_s": 0.0,
+                "rolling_kd_deg_s_per_px": 0.0,
+                "trim_enabled": False,
+            },
+            None,
+        ),
+        (
+            CASCADE_PID_BACKEND,
+            None,
+            {
+                "velocity_ki_s2_inv": 0.0,
+                "velocity_kd": 0.0,
+                "position_filter_tau_s": 0.0,
+                "velocity_filter_tau_s": 0.0,
+                "feedback_filter_tau_s": 0.0,
+            },
+        ),
+    )
+    for backend_name, reference_settings, cascade_settings in backend_cases:
+        shared_controller = create_control_backend(
+            backend_name,
+            dict(common_control_settings, ki=0.0),
+            reference_settings=reference_settings,
+            cascade_settings=cascade_settings,
+        )
+        shared_rx = tracker_main.UartReferenceCommandRx(
+            FakeReferenceUart(
+                encode_reference_command_frame(shared_reference_cm)
+            ),
+            shared_controller,
+        )
+        assert shared_rx.poll() == shared_reference_cm
+        assert shared_controller.reference_position_cm == shared_reference_cm
+        assert shared_controller.reference_state_flags == (
+            BALL_REFERENCE_FLAG_VALID | BALL_REFERENCE_FLAG_SOURCE_MCU
+        )
+        centered_feedback = shared_controller.update(
+            shared_reference_state,
+            reference_candidate,
+            7000,
+        )
+        assert centered_feedback["control_backend"] == backend_name
+        assert centered_feedback["reference_position_cm"] == shared_reference_cm
+        assert abs(centered_feedback["position_error_cm"]) < 0.001
+        assert abs(centered_feedback["feedback_acceleration_cm_s2"]) < 0.001
+        centered_frame = encode_ball_state_frame(
+            10,
+            7000,
+            BALL_FLAG_RAW_DETECTED
+            | BALL_FLAG_MEASUREMENT_ACCEPTED
+            | BALL_FLAG_TRACK_VALID
+            | BALL_FLAG_FEEDBACK_VALID,
+            shared_reference_state,
+            reference_candidate,
+            1,
+            centered_feedback,
+        )
+        centered_decoded = decode_ball_state_frame(centered_frame)
+        assert centered_decoded["reference_position_cm"] == shared_reference_cm
+        assert centered_decoded["position_error_cm"] == 0.0
+        assert centered_decoded["reference_state_flags"] == (
+            BALL_REFERENCE_FLAG_VALID | BALL_REFERENCE_FLAG_SOURCE_MCU
+        )
+        shifted_feedback = shared_controller.update(
+            shifted_reference_state,
+            reference_candidate,
+            7033,
+        )
+        assert shifted_feedback["position_error_cm"] > 0.9
+        assert shifted_feedback["feedback_acceleration_cm_s2"] < 0.0
     try:
         create_control_backend("unknown", dict(common_control_settings))
         raise AssertionError("unknown control backend must fail")

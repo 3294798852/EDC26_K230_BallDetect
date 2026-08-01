@@ -179,6 +179,15 @@ enters the existing visible FATAL path rather than being silently ignored.
   prediction hold for at most 8 frames and 300 ms; either limit ending first
   changes the state to fully lost.
 
+The Edge-Hough backend also has an independently switchable position layer.
+`HOUGH_POSITION_FILTER_ENABLED=True` hard-limits candidate centers to
+`Y=160+/-16 px` and `X=160+/-145 px`. For acquisition/reacquisition it prefers
+the central `X=160+/-120 px` region before considering the two outer 25 px end
+bands. An already valid track still follows predicted distance at the ends.
+Setting the master switch to `False` bypasses this entire additional layer;
+all center coordinates and half-ranges remain configurable beside it in
+`main.py`.
+
 ## Visual state feedback
 
 `X_CALIBRATION_MODE` in `main.py` selects one of two precomputed 320-entry X
@@ -204,8 +213,9 @@ changing tracking, calibration or UART framing:
 | --- | --- |
 | `"pid"` | established physical-unit filtered PI-D controller; default |
 | `"reference_profile"` | port of the supplied balance-ball controller with approach-dependent D action, rolling/stationary/breakaway profiles and slow tilt trim |
+| `"cascade_pid"` | independent position-P outer loop and velocity-PID inner loop with bounded velocity reference and anti-windup |
 
-Both backends consume calibrated centimeters and cm/s and publish the same
+All backends consume calibrated centimeters and cm/s and publish the same
 bounded equivalent ball acceleration `a_fb` in cm/s2. The MCU continues to own
 vehicle-acceleration feedforward, rolling-model inversion, pipe-angle control,
 actuator limits and safe state. No UART decoder change is required.
@@ -218,8 +228,8 @@ e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
 r = clamp(1 - abs(e_f)/5, 0, 1) when scheduling is enabled, else 0
 Kp_eff = Kp * (1 + 2*r)
 Kd_eff = Kd * (1 + 4*r)
-I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
-a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.30), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.30) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
 n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
 a_fb = clamp(LPF(a_raw, 25 ms) + n, +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
@@ -236,28 +246,55 @@ absolute `x/v/a` plus feedback computed from `e=x-x_ref`.
 
 Defaults are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. Position, velocity and
 output filters use `25/50/25 ms` time constants. Position and velocity soft
-deadbands are `0.10 cm` and `0.35 cm/s`; both must be inside their bands before
+deadbands are `0.30 cm` and `0.35 cm/s`; both must be inside their bands before
 the dynamic feedback is treated as settled. The integral correction is bounded
 to `+/-80 cm/s2`, integrates at most `+/-1 cm` error, leaks at `0.15/s`, and
 holds during predicted frames. Final `a_fb` remains bounded to `+/-140 cm/s2`.
 UART still reports the tracked physical state before control deadbands.
+
+The optional `cascade_pid` backend is implemented independently in
+`ball_control_backends.py`:
+
+```text
+e_x = Db(x - x_ref, position_deadband)
+v_ref = clamp(-Kx * e_x, +/-v_ref_max)
+e_v = v_ref - Db(v, velocity_deadband)
+I_v += (Ki_v * clamp(e_v, +/-e_v_max) - leak * I_v) * dt
+a_raw = Kv * e_v + I_v - Kdv * measured_acceleration
+```
+
+The inner integral is bounded, stops learning on prediction-only frames, and
+does not integrate farther into output saturation. Defaults are `Kx=0.55/s`,
+`Kv=12/s`, `Ki_v=18/s2`, `Kdv=0`, `v_ref_max=6 cm/s`, and an `80 cm/s2`
+integral bound. Opposing velocity error unloads the integral at `4x` rate and
+is clamped at zero before any opposite correction is learned. Cascade-only
+position/velocity/output filters are `15/35/10 ms` to limit control delay.
+These values are isolated in `CASCADE_CONTROL_SETTINGS`; the
+original PID and reference-profile settings are unchanged. The existing UART
+schema remains unchanged and its `reference_velocity_cm_s` field carries the
+live cascade velocity target. On the touch panel, `Kx/Kv/Ki` adjust the outer
+position P, inner velocity P and inner velocity I gains respectively; inner D
+remains the explicit `velocity_kd` configuration value.
 
 `FEEDBACK_PD_SCHEDULE_ENABLED` controls the PID-only near-target gain schedule.
 With its default 5 cm radius, errors at or beyond 5 cm use the touch-adjusted
 base gains. The scales rise linearly toward the reference, reaching `3x Kp`
 and `5x Kd` at zero error. The position/velocity soft deadbands still act after
 gain selection, so zero position and velocity do not create an output. Disable
-the option to use constant gains exactly. `reference_profile` ignores this
-switch because it already owns a separate target-approach D schedule. LCD shows
+the option to use constant gains exactly. `reference_profile` and `cascade_pid`
+force this switch off; the former owns a separate target-approach D schedule and
+the latter has its own outer/inner gains. LCD shows
 the current P/D scales; PC debug reports base and effective gains.
 
-`FEEDBACK_DITHER_ENABLED` controls a bounded zero-mean uniform dither added
+`FEEDBACK_DITHER_ENABLED` controls an optional bounded zero-mean uniform dither added
 after the output low-pass filter and before the final clamp. Its default
 amplitude is limited to `+/-5 cm/s2`, set by
 `FEEDBACK_DITHER_AMPLITUDE_CM_S2`. Each random magnitude is reused for two
 valid frames with opposite signs, and the sign flips on every valid
 `DETECT/HOLD` frame to help overcome static friction without a pairwise bias;
-`LOST` still sends zero feedback. The implementation uses a fixed-memory
+`LOST` still sends zero feedback. It defaults to `False` because deliberate
+frame-to-frame excitation conflicts with minimum-jitter one-centimeter holding;
+enable it only when measured static friction requires it. The implementation uses a fixed-memory
 32-bit generator and does not depend on a K230 `random` module. Set the switch
 to `False` to recover the deterministic PI-D output exactly.
 
@@ -278,11 +315,14 @@ hard pulses and car feedforward are intentionally not ported because they are
 MCU responsibilities. This backend requires conservative actuator-disabled
 sign checks and K230/MCU hardware retuning before closed-loop use.
 
-LCD feedback line prefixes identify `PID` or `REF`; reference mode additionally
+LCD feedback line prefixes identify `PID`, `CAS` or `REF`; cascade mode shows
+its velocity target/error, output and inner integral, while reference mode
+additionally
 shows its profile, angle-equivalent correction, D scale, breakaway bias and trim.
 PC debug exposes the same backend-specific values.
 
-The bottom LCD panel provides `Kp/Kd/Ki` `-` and `+` buttons. Each distinct
+The bottom LCD panel provides `Kp/Kd/Ki` (`Kx/Kv/Ki` in cascade mode) `-` and
+`+` buttons. Each distinct
 press changes one gain by `0.1`; holding or moving a finger does not repeat.
 Changes apply immediately, remain RAM-only, and reset to the constants in
 `main.py` after reboot. Touch initialization/read failures are shown on LCD and

@@ -12,6 +12,7 @@ filter, three tracking states and feedback law remain unchanged.
   -> cv_lite internal Canny edge extraction and Hough-circle voting
   -> at most 24 raw circle triples
   -> radius, pipe-axis and endpoint gates
+  -> optional center-position hard gates and acquisition priority
   -> prediction/observed-radius scoring when a track exists
   -> near-duplicate circle suppression
   -> at most four candidates
@@ -82,6 +83,11 @@ adjust the `HOUGH_*` constants in `main.py`:
 | `HOUGH_CLUSTER_RADIUS_TOLERANCE_PX` | 2 px | maximum radius difference inside one cluster |
 | `HOUGH_TRACKED_RADIUS_TOLERANCE_PX` | 3 px | reject implausible radius changes near an active track |
 | `HOUGH_AMBIGUOUS_SPREAD_RADIUS_FACTOR` | 0.65 | flag a wide fused cluster for stricter motion confirmation |
+| `HOUGH_POSITION_FILTER_ENABLED` | `True` | master switch for the complete extra image-position layer |
+| `HOUGH_POSITION_CENTER_X/Y_PX` | 160/160 px | image center used by the extra position layer |
+| `HOUGH_POSITION_Y_HALF_HEIGHT_PX` | 16 px | hard reject circle centers outside `Y=144..176` |
+| `HOUGH_POSITION_X_PREFERRED_HALF_WIDTH_PX` | 120 px | preferred acquisition region `X=40..280` |
+| `HOUGH_POSITION_X_HARD_HALF_WIDTH_PX` | 145 px | hard reject circle centers outside `X=15..305` |
 
 Lowering the Canny threshold admits weaker edges but also pipe texture. Lowering
 the accumulator threshold tolerates a shorter visible arc but increases false
@@ -95,19 +101,34 @@ visible pipe wall. A returned circle that touches the cropped-image boundary is
 marked `edge_clipped`: it cannot establish a new track, but an existing
 prediction may follow it through the tracker's stricter edge association gate.
 
+The optional position layer is also separate from the pipe-axis gate. When its
+master switch is `False`, its hard rejection, priority, counters and special
+sorting are all bypassed, restoring the original Hough candidate behavior.
+When enabled, Y and outer X ranges are inclusive hard center-coordinate gates.
+During acquisition or an explicit `REACQUIRE`, any candidate inside the central
+`+/-120 px` X region outranks candidates in the two remaining 25 px end bands;
+normal score then breaks ties inside the same region. This is a soft acquisition
+preference, not a ban on end travel: while a valid track exists, the tracker
+continues to use predicted distance first, so a real ball already moving near
+`X=15` or `X=305` is not replaced by an unrelated center candidate.
+
 ## Diagnostics and tuning
 
 The screen and PC debug line identify `edge_hough`, draw the pipe search band
 and report:
 
 ```text
-H<accepted>/<clusters>/<raw> S<support> D<center>/<radius> Q<quality>[A]
+H<accepted>/<clusters>/<raw> G<preferred>/<outer>/<rejected><E|->
+S<support> D<center>/<radius> Q<quality>[A]
 h<hint> P<Canny>/<accumulator>
 ```
 
 `S` is the selected cluster's circle count, `D` gives maximum spread in pixels,
 `Q` is quality in percent, and `A` marks an ambiguous spread. `h=1` means a
-non-expired motion prediction is available. A `circles clipped` warning means
+non-expired motion prediction is available. `G` reports fused preferred/outer
+candidates followed by raw circles rejected by the position hard gates; `E`
+means the layer is enabled and `-` means fully bypassed. A `circles clipped`
+warning means
 native Hough returned more than the bounded raw-candidate limit. The following
 motion suffix adds `W` when the selected center is outside the strict quiet gate
 and `C` when another similarly close candidate competes with it. Both are

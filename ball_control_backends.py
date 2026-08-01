@@ -7,7 +7,12 @@ from ball_control import BallStateFeedback, _clamp
 
 REFERENCE_BACKEND = "reference_profile"
 PID_BACKEND = "pid"
-SUPPORTED_CONTROL_BACKENDS = (PID_BACKEND, REFERENCE_BACKEND)
+CASCADE_PID_BACKEND = "cascade_pid"
+SUPPORTED_CONTROL_BACKENDS = (
+    PID_BACKEND,
+    REFERENCE_BACKEND,
+    CASCADE_PID_BACKEND,
+)
 
 
 def _approach(value, target, maximum_step):
@@ -83,11 +88,15 @@ class ReferenceProfileFeedback(BallStateFeedback):
             float(settings.get("stationary_kp_deg_per_px", 0.055))
             / max(rolling_kp_deg_per_px, 0.000001),
         )
-        self.position_deadband_cm = max(
-            0.0,
-            float(settings.get("deadband_px", 3.0))
-            / self.source_pixels_per_cm,
-        )
+        deadband_cm = settings.get("deadband_cm")
+        if deadband_cm is None and "deadband_px" in settings:
+            deadband_cm = (
+                float(settings.get("deadband_px", 0.0))
+                / self.source_pixels_per_cm
+            )
+        if deadband_cm is None:
+            deadband_cm = common_kwargs.get("position_deadband_cm", 0.30)
+        self.position_deadband_cm = max(0.0, float(deadband_cm))
         self.velocity_deadband_cm_s = 0.0
         self.proportional_limit_deg = max(
             0.0,
@@ -396,16 +405,13 @@ class ReferenceProfileFeedback(BallStateFeedback):
         dt,
         now_ms,
     ):
-        del feedback_position_cm, feedback_velocity_cm_s, settled
+        del feedback_velocity_cm_s, settled
         error_cm = float(control_error_cm)
         velocity_cm_s = float(control_velocity_cm_s)
         source_error_px = -error_cm * self.source_pixels_per_cm
         source_velocity_px_s = velocity_cm_s * self.source_pixels_per_cm
         control_error_px = (
-            0.0
-            if abs(source_error_px)
-            <= self.position_deadband_cm * self.source_pixels_per_cm
-            else source_error_px
+            -float(feedback_position_cm) * self.source_pixels_per_cm
         )
         self.joint_deadband_active = bool(
             control_error_px == 0.0
@@ -510,13 +516,241 @@ class ReferenceProfileFeedback(BallStateFeedback):
         return snapshot
 
 
-def create_control_backend(name, common_settings, reference_settings=None):
+class CascadePidFeedback(BallStateFeedback):
+    """Position-P outer loop and velocity-PID inner loop in physical units."""
+
+    backend_name = CASCADE_PID_BACKEND
+    touch_gain_labels = ("Kx", "Kv", "Ki")
+
+    def __init__(self, cascade_settings=None, **common_kwargs):
+        settings = cascade_settings or {}
+        for filter_name, default_value in (
+            ("position_filter_tau_s", 0.015),
+            ("velocity_filter_tau_s", 0.035),
+            ("feedback_filter_tau_s", 0.010),
+        ):
+            common_kwargs[filter_name] = max(
+                0.0,
+                float(settings.get(filter_name, default_value)),
+            )
+        common_kwargs["kp"] = max(
+            0.0,
+            float(settings.get("position_kp_s_inv", 0.55)),
+        )
+        common_kwargs["kd"] = max(
+            0.0,
+            float(settings.get("velocity_kp_s_inv", 12.0)),
+        )
+        common_kwargs["ki"] = max(
+            0.0,
+            float(settings.get("velocity_ki_s2_inv", 18.0)),
+        )
+        common_kwargs["ka"] = max(
+            0.0,
+            float(settings.get("velocity_kd", 0.0)),
+        )
+        common_kwargs["pd_schedule_enabled"] = False
+        common_kwargs["integral_limit_cm_s2"] = max(
+            0.0,
+            float(settings.get("velocity_integral_limit_cm_s2", 80.0)),
+        )
+        common_kwargs["integral_leak_per_s"] = max(
+            0.0,
+            float(settings.get("velocity_integral_leak_per_s", 0.05)),
+        )
+        super().__init__(**common_kwargs)
+
+        self.max_reference_velocity_cm_s = max(
+            0.1,
+            float(settings.get("max_reference_velocity_cm_s", 6.0)),
+        )
+        self.velocity_integral_error_limit_cm_s = max(
+            0.0,
+            float(settings.get("velocity_integral_error_limit_cm_s", 4.0)),
+        )
+        self.velocity_integral_leak_per_s = self.integral_leak_per_s
+        self.velocity_integral_unwind_scale = max(
+            1.0,
+            float(settings.get("velocity_integral_unwind_scale", 4.0)),
+        )
+        self.cascade_reference_velocity_cm_s = 0.0
+        self.cascade_velocity_error_cm_s = 0.0
+        self.cascade_position_limited = False
+        self.cascade_inner_p_cm_s2 = 0.0
+        self.cascade_inner_i_cm_s2 = 0.0
+        self.cascade_inner_d_cm_s2 = 0.0
+        self.cascade_integral_unwind_active = False
+
+    def reset_runtime(self):
+        super().reset_runtime()
+        self.cascade_reference_velocity_cm_s = 0.0
+        self.cascade_velocity_error_cm_s = 0.0
+        self.cascade_position_limited = False
+        self.cascade_inner_p_cm_s2 = 0.0
+        self.cascade_inner_i_cm_s2 = 0.0
+        self.cascade_inner_d_cm_s2 = 0.0
+        self.cascade_integral_unwind_active = False
+
+    def _update_velocity_integral(
+        self,
+        velocity_error_cm_s,
+        position_error_active,
+        dynamic_feedback_cm_s2,
+        measurement_current,
+        settled,
+        dt,
+    ):
+        self.integral_learning = False
+        self.integral_limited = False
+        self.cascade_integral_unwind_active = False
+        if self.ki <= 0.0 or self.integral_limit_cm_s2 <= 0.0:
+            self.integral_correction_cm_s2 = 0.0
+            self.integral_state = "OFF"
+            return
+        if not measurement_current:
+            self.integral_state = "HOLD"
+            return
+        if settled:
+            self.integral_state = "SETTLE"
+            return
+
+        bounded_error = _clamp(
+            float(velocity_error_cm_s),
+            -self.velocity_integral_error_limit_cm_s,
+            self.velocity_integral_error_limit_cm_s,
+        )
+        previous = self.integral_correction_cm_s2
+        error_drive = self.ki * bounded_error
+        unwinding = bool(previous * error_drive < 0.0)
+        self.cascade_integral_unwind_active = unwinding
+        if not position_error_active and not unwinding:
+            self.integral_state = "CENTER"
+            return
+        if unwinding:
+            error_drive *= self.velocity_integral_unwind_scale
+        rate = error_drive - self.velocity_integral_leak_per_s * previous
+        proposed = _clamp(
+            previous + rate * float(dt),
+            -self.integral_limit_cm_s2,
+            self.integral_limit_cm_s2,
+        )
+        if unwinding and previous * proposed < 0.0:
+            proposed = 0.0
+        delta = proposed - previous
+        proposed_feedback = dynamic_feedback_cm_s2 + proposed
+        if (
+            proposed_feedback > self.max_feedback_accel_cm_s2
+            and delta > 0.0
+        ) or (
+            proposed_feedback < -self.max_feedback_accel_cm_s2
+            and delta < 0.0
+        ):
+            self.integral_limited = True
+            self.integral_state = "LIMIT"
+            return
+        self.integral_correction_cm_s2 = proposed
+        self.integral_learning = proposed != previous
+        self.integral_limited = bool(
+            abs(proposed) >= self.integral_limit_cm_s2
+        )
+        if self.integral_limited:
+            self.integral_state = "LIMIT"
+        elif unwinding:
+            self.integral_state = "UNWIND"
+        else:
+            self.integral_state = "TRACK"
+
+    def _compute_unconstrained_feedback(
+        self,
+        control_error_cm,
+        control_velocity_cm_s,
+        feedback_position_cm,
+        feedback_velocity_cm_s,
+        measurement_current,
+        settled,
+        dt,
+        now_ms,
+    ):
+        del control_error_cm, control_velocity_cm_s, now_ms
+        requested_velocity = -self.kp * float(feedback_position_cm)
+        self.cascade_reference_velocity_cm_s = _clamp(
+            requested_velocity,
+            -self.max_reference_velocity_cm_s,
+            self.max_reference_velocity_cm_s,
+        )
+        self.cascade_position_limited = bool(
+            self.cascade_reference_velocity_cm_s != requested_velocity
+        )
+        self.cascade_velocity_error_cm_s = (
+            self.cascade_reference_velocity_cm_s
+            - float(feedback_velocity_cm_s)
+        )
+        self.cascade_inner_p_cm_s2 = (
+            self.kd * self.cascade_velocity_error_cm_s
+        )
+        self.cascade_inner_d_cm_s2 = -self.ka * self.acceleration_cm_s2
+        dynamic_feedback = (
+            self.cascade_inner_p_cm_s2 + self.cascade_inner_d_cm_s2
+        )
+        self._update_velocity_integral(
+            self.cascade_velocity_error_cm_s,
+            bool(feedback_position_cm != 0.0),
+            dynamic_feedback,
+            measurement_current,
+            settled,
+            dt,
+        )
+        self.cascade_inner_i_cm_s2 = self.integral_correction_cm_s2
+        self.effective_kp = self.kp
+        self.effective_kd = self.kd
+        return dynamic_feedback + self.integral_correction_cm_s2
+
+    def _snapshot(self, *args, **kwargs):
+        snapshot = super()._snapshot(*args, **kwargs)
+        snapshot["reference_velocity_cm_s"] = float(
+            self.cascade_reference_velocity_cm_s
+        )
+        snapshot["cascade_velocity_error_cm_s"] = float(
+            self.cascade_velocity_error_cm_s
+        )
+        snapshot["cascade_position_limited"] = bool(
+            self.cascade_position_limited
+        )
+        snapshot["cascade_inner_p_cm_s2"] = float(
+            self.cascade_inner_p_cm_s2
+        )
+        snapshot["cascade_inner_i_cm_s2"] = float(
+            self.cascade_inner_i_cm_s2
+        )
+        snapshot["cascade_inner_d_cm_s2"] = float(
+            self.cascade_inner_d_cm_s2
+        )
+        snapshot["cascade_max_reference_velocity_cm_s"] = float(
+            self.max_reference_velocity_cm_s
+        )
+        snapshot["cascade_integral_unwind_active"] = bool(
+            self.cascade_integral_unwind_active
+        )
+        return snapshot
+
+
+def create_control_backend(
+    name,
+    common_settings,
+    reference_settings=None,
+    cascade_settings=None,
+):
     backend = str(name).strip().lower()
     if backend == PID_BACKEND:
         return BallStateFeedback(**common_settings)
     if backend == REFERENCE_BACKEND:
         return ReferenceProfileFeedback(
             reference_settings=reference_settings,
+            **common_settings
+        )
+    if backend == CASCADE_PID_BACKEND:
+        return CascadePidFeedback(
+            cascade_settings=cascade_settings,
             **common_settings
         )
     raise ValueError(

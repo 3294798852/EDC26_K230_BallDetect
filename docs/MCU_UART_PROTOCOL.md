@@ -109,12 +109,12 @@ All multibyte fields are little-endian. CRC16-CCITT-FALSE uses polynomial
 | 22..23 | 36..37 | 2 | `i16`, /10 | feedback component `a_fb`, cm/s2 |
 | 24..25 | 38..39 | 2 | `u16` ms | total selected-detector run time; YOLO, ROI and Hough share this field |
 | 26..27 | 40..41 | 2 | `u16` ms | accepted-measurement age; `0xFFFF` unavailable |
-| 28..29 | 42..43 | 2 | `u16`, /100 | `Kp` |
-| 30 | 44 | 1 | `u8`, /10 | `Kd` |
-| 31 | 45 | 1 | `u8`, /100 | `Ka` |
+| 28..29 | 42..43 | 2 | `u16`, /100 | base `Kp`; cascade mode: outer `Kx` |
+| 30 | 44 | 1 | `u8`, /10 | base `Kd`; cascade mode: inner `Kv` |
+| 31 | 45 | 1 | `u8`, /100 | base `Ka`; cascade mode: inner `Kdv` |
 | 32..33 | 46..47 | 2 | `i16`, /100 cm | active absolute reference position `x_ref` |
 | 34..35 | 48..49 | 2 | `i16`, /100 cm | position error `e=x-x_ref`; zero when feedback invalid |
-| 36..37 | 50..51 | 2 | `i16`, /10 cm/s | reference velocity `v_ref`; currently zero |
+| 36..37 | 50..51 | 2 | `i16`, /10 cm/s | reference velocity `v_ref`; cascade mode carries its bounded outer-loop target, otherwise zero |
 | 38..39 | 52..53 | 2 | `i16`, /10 cm/s2 | reference acceleration `a_ref`; currently zero |
 | 40..41 | 54..55 | 2 | `u16` | reference state/source flags |
 | 42..47 | 56..61 | 6 | bytes | reserved extension; schema 6 requires all zero |
@@ -127,8 +127,8 @@ e_f = LPF(e, 25 ms), v_f = LPF(v, 50 ms)
 r = clamp(1 - abs(e_f)/5, 0, 1) when PID scheduling is enabled, else 0
 Kp_eff = Kp * (1 + 2*r)
 Kd_eff = Kd * (1 + 4*r)
-I = clamp(I + (-Ki*clamp(Db(e_f, 0.10), +/-1.0) - 0.15*I)*dt, +/-80)
-a_raw = -(Kp_eff*Db(e_f, 0.10) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
+I = clamp(I + (-Ki*clamp(Db(e_f, 0.30), +/-1.0) - 0.15*I)*dt, +/-80)
+a_raw = -(Kp_eff*Db(e_f, 0.30) + Kd_eff*Db(v_f, 0.35) + Ka*a) + I
 n = alternating_sign * pair_uniform(0, 5] when enabled, else 0
 a_fb = clamp(LPF(a_raw, 25 ms) + n, +/-140)
 Db(z, width) = sign(z) * max(abs(z) - width, 0)
@@ -137,8 +137,9 @@ Db(z, width) = sign(z) * max(abs(z) - width, 0)
 Default gains are `Kp=8.0`, `Kd=12.0`, `Ki=12.0`, `Ka=0`. `I` is bounded to
 `+/-80 cm/s2`, leaks at `0.15/s`, uses conditional anti-windup, holds on
 predicted frames and resets on full loss/filter reset. Final `a_fb` is bounded
-to `+/-140 cm/s2`. With dither enabled by default, `n` alternates sign on every
-valid `DETECT/HOLD` frame and is bounded to `+/-5 cm/s2`. Each random magnitude
+to `+/-140 cm/s2`. Dither defaults off for low-jitter holding. If explicitly
+enabled, `n` alternates sign on every valid `DETECT/HOLD` frame and is bounded
+to `+/-5 cm/s2`. Each random magnitude
 is reused for one positive/negative pair. It is zero for `LOST`, which does not
 advance the alternation. The UART `a_fb` field already contains this dither and
 the MCU must not add it again. Set `FEEDBACK_DITHER_ENABLED=False` on K230 to
@@ -161,9 +162,26 @@ are the active backend's base physical-unit-equivalent gains; scheduled D,
 profile P, breakaway and trim state cannot be reconstructed from those fields.
 Always consume the complete `a_fb` instead of recalculating it.
 
+With `CONTROL_BACKEND="cascade_pid"`, the same `a_fb` field carries the output
+of a position-P outer loop and velocity-PID inner loop:
+
+```text
+v_ref = clamp(-Kx*Db(x-x_ref, 0.30), +/-6 cm/s)
+e_v = v_ref - Db(v, 0.35 cm/s)
+a_raw = Kv*e_v + I_v - Kdv*a
+```
+
+The default `Kx/Kv/Ki_v/Kdv` values are `0.55/12/18/0`; the inner integral is
+bounded to `+/-80 cm/s2`, freezes during prediction, and has conditional
+anti-windup. Opposing velocity error withdraws it at four times the learning
+rate and clamps it at zero before reversing sign. The transmitted `v_ref` is the live bounded outer-loop target.
+The existing `Kp/Kd/Ka` slots carry `Kx/Kv/Kdv`; inner `Ki_v` is not encoded.
+The MCU must use final `a_fb` and must not close a second position or velocity
+loop over the same visual state.
+
 Backend selection is compile-time K230 configuration and is shown on its LCD
 and PC debug output; schema 6 does not add a backend identifier. Record the
-selected backend as part of the test configuration. In either mode, vehicle
+selected backend as part of the test configuration. In every mode, vehicle
 feedforward, pipe-angle inversion, measured-angle inner loop, actuator limits
 and safety remain MCU responsibilities. In reference mode,
 `FEEDBACK_SATURATED` is also set by its internal proportional/dynamic-angle
@@ -175,10 +193,11 @@ ball position. The LCD and PC debug output also show `x`, `ref` and `e`. The MCU
 can cross-check position/reference consistency and feedback bounds, but cannot
 reconstruct every quiet-state `a_fb` sample from the UART fields alone. It must
 not apply the same `Kp/Kd` feedback or integrate the same position error a
-second time. A
-future MCU command that changes the reference must define validation, sequence,
-acknowledgement, applied-value reporting and a bounded slew/ramp before it is
-safety-usable. A reference step changes the proportional target by
+second time. The current fixed 10-byte set-reference command updates the origin
+for all selectable K230 control backends (`pid`, `reference_profile`, and
+`cascade_pid`); none continues using image-center zero after a valid command.
+The MCU should confirm application through echoed `x_ref`, the `SOURCE_MCU`
+flag and `e=x-x_ref`. A reference step changes the proportional target by
 `Kp*Delta x_ref`; the existing 25 ms output filter smooths its published
 `a_fb` transition.
 

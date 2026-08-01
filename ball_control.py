@@ -58,7 +58,7 @@ class BallStateFeedback:
         max_measurement_age_ms=80,
         max_prediction_age_ms=300,
         max_prediction_frames=8,
-        position_deadband_cm=0.10,
+        position_deadband_cm=0.30,
         velocity_deadband_cm_s=0.35,
         position_filter_tau_s=0.025,
         velocity_filter_tau_s=0.050,
